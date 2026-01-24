@@ -49,14 +49,18 @@ jobs:
         toolchain: ${{ matrix.rust }}
     - uses: Swatinem/rust-cache@v2
     - uses: taiki-e/install-action@cargo-hack
-    - name: Build
+    - name: Build (non-Windows)
+      if: matrix.os != 'windows-latest'
       run: cargo test --workspace --no-run
+    - name: Build (Windows - skip ONNX features due to runtime library mismatch)
+      if: matrix.os == 'windows-latest'
+      run: cargo test --workspace --no-run --no-default-features
     - name: Test (non-Windows)
       if: matrix.os != 'windows-latest'
       run: cargo hack test --each-feature --workspace
-    - name: Test (Windows - skip fastembed features)
+    - name: Test (Windows - skip ONNX features due to runtime library mismatch)
       if: matrix.os == 'windows-latest'
-      run: cargo hack test --each-feature --workspace --exclude-features fastembed
+      run: cargo hack test --each-feature --workspace --exclude-features fastembed,mixedbread
   msrv:
     name: "Check MSRV"
     runs-on: ubuntu-latest
