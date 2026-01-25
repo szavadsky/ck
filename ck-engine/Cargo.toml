@@ -11,12 +11,12 @@ keywords = ["search", "engine", "semantic"]
 categories = ["algorithms"]
 
 [dependencies]
-ck-core = { version = "0.7.3", path = "../ck-core" }
-ck-index = { version = "0.7.3", path = "../ck-index" }
-ck-embed = { version = "0.7.3", path = "../ck-embed", default-features = false }
-ck-ann = { version = "0.7.3", path = "../ck-ann" }
-ck-chunk = { version = "0.7.3", path = "../ck-chunk" }
-ck-models = { version = "0.7.3", path = "../ck-models" }
+ck-core = { version = "0.7.4", path = "../ck-core" }
+ck-index = { version = "0.7.4", path = "../ck-index", default-features = false }
+ck-embed = { version = "0.7.4", path = "../ck-embed", default-features = false }
+ck-ann = { version = "0.7.4", path = "../ck-ann" }
+ck-chunk = { version = "0.7.4", path = "../ck-chunk", default-features = false }
+ck-models = { version = "0.7.4", path = "../ck-models" }
 serde_json = { workspace = true }
 
 anyhow = { workspace = true }
@@ -31,8 +31,8 @@ globset = { workspace = true }
 
 [features]
 default = ["fastembed", "mixedbread"]
-fastembed = ["ck-embed/fastembed"]
-mixedbread = ["ck-embed/mixedbread"]
+fastembed = ["ck-embed/fastembed", "ck-index/fastembed", "ck-chunk/fastembed"]
+mixedbread = ["ck-embed/mixedbread", "ck-index/mixedbread", "ck-chunk/mixedbread"]
 
 [dev-dependencies]
 tempfile = "3.8"
