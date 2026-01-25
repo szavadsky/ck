@@ -200,14 +200,15 @@ jobs:
         verify_crate() {
           local package=$1
           local version=$2
-          local max_attempts=20
-          local wait_time=30
+          local max_attempts=10
+          local wait_time=60
           local url="https://crates.io/api/v1/crates/${package}/${version}"
 
           echo "Verifying $package v$version is available on crates.io..."
 
           for attempt in $(seq 1 $max_attempts); do
-            if curl --silent --show-error --fail "$url" >/dev/null; then
+            # crates.io API requires User-Agent header
+            if curl --silent --show-error --fail -H "User-Agent: ck-ci (github.com/BeaconBay/ck)" "$url" >/dev/null; then
               echo "$package v$version verified on crates.io"
               return 0
             fi
@@ -217,7 +218,7 @@ jobs:
           done
 
           echo "Failed to verify $package v$version on crates.io"
-          curl --silent --show-error "$url" || true
+          curl --silent --show-error -H "User-Agent: ck-ci (github.com/BeaconBay/ck)" "$url" || true
           return 1
         }
 
@@ -232,6 +233,7 @@ jobs:
           "ck-ann"
           "ck-index"
           "ck-engine"
+          "ck-tui"
           "ck-search"
         )
 
