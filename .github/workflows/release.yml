@@ -125,8 +125,9 @@ jobs:
         run: |
           # Different approaches for different platforms
           if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            # Windows approach from c0a84af - no --locked, no vendored features, use system OpenSSL
-            ${{ env.CARGO_CMD }} build --release --target ${{ matrix.target }} --package ck-search
+            # Windows: Build without mixedbread feature to avoid esaxx-rs/ort runtime library mismatch
+            # See: https://github.com/huggingface/tokenizers/issues/1482
+            ${{ env.CARGO_CMD }} build --release --target ${{ matrix.target }} --package ck-search --no-default-features --features=fastembed
           elif [ "${{ matrix.os }}" = "macos-latest" ]; then
             # macOS approach - use system OpenSSL to avoid cross-compilation issues
             ${{ env.CARGO_CMD }} build --locked --release --target ${{ matrix.target }} --package ck-search

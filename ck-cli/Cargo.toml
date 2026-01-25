@@ -25,7 +25,7 @@ ck-core = { version = "0.7.2", path = "../ck-core" }
 ck-index = { version = "0.7.2", path = "../ck-index" }
 ck-engine = { version = "0.7.2", path = "../ck-engine" }
 ck-chunk = { version = "0.7.2", path = "../ck-chunk" }
-ck-embed = { version = "0.7.2", path = "../ck-embed" }
+ck-embed = { version = "0.7.2", path = "../ck-embed", default-features = false }
 ck-ann = { version = "0.7.2", path = "../ck-ann" }
 ck-models = { version = "0.7.2", path = "../ck-models" }
 ck-tui = { version = "0.7.2", path = "../ck-tui" }
@@ -61,6 +61,9 @@ sha2 = { workspace = true }
 dirs = "5.0"
 
 [features]
+default = ["fastembed", "mixedbread"]
+fastembed = ["ck-embed/fastembed"]
+mixedbread = ["ck-embed/mixedbread"]
 vendored-openssl = ["openssl?/vendored"]
 
 [dev-dependencies]
