@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- **Markdown language support**: Structure-aware chunking for Markdown files - headings, sections, code blocks
+
 ## [0.7.2] - 2026-01-24
 
 ### Added

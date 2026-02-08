@@ -272,12 +272,13 @@ Why JSONL for AI agents:
 | JavaScript/TypeScript | ✅ | Functions, classes, methods |
 | Rust | ✅ | Functions, structs, traits |
 | Go | ✅ | Functions, types, methods |
+| Markdown | ✅ | Headings, sections, code blocks |
 | Ruby | ✅ | Classes, methods, modules |
 | Haskell | ✅ | Functions, types, instances |
 | C# | ✅ | Classes, interfaces, methods |
 | Zig | ✅ | Functions, structs |
 
-Text formats (Markdown, JSON, YAML, TOML, XML, HTML, CSS, shell scripts, SQL) are also supported with content-based chunking.
+Text formats (JSON, YAML, TOML, XML, HTML, CSS, shell scripts, SQL) are also supported with content-based chunking.
 
 ### Binary Detection
 
