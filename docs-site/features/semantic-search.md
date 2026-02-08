@@ -227,8 +227,8 @@ Semantic search finds code by meaning, which can include related concepts. Searc
 
 Semantic search works with all supported languages:
 
-- **Strong support** – Python, JavaScript/TypeScript, Rust, Go, C, C++, Ruby, C#, Haskell, Zig, Dart, Elixir
-- **Text formats** – Markdown, config files, documentation
+- **Strong support** – Python, JavaScript/TypeScript, Rust, Go, C, C++, Ruby, C#, Haskell, Zig, Dart, Elixir, Markdown
+- **Text formats** – config files, documentation
 - **Binary detection** – Automatically skips non-text files
 
 Each language uses tree-sitter for intelligent chunking at function/class boundaries.

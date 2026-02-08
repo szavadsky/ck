@@ -234,6 +234,7 @@ ck --sem --scores "machine learning" docs/
 
 | Language | Indexing | Chunking | AST-aware | Notes |
 |----------|----------|----------|-----------|-------|
+| Markdown | ✅ | ✅ | ✅ | Headings, sections, code blocks |
 | Zig | ✅ | ✅ | ✅ | contributed by [@Nevon](https://github.com/Nevon) (PR #72) |
 
 ### Model Selection
@@ -290,6 +291,7 @@ ck --inspect --model bge-small src/main.rs  # Test different models
 | JavaScript/TypeScript | ✅ | ✅ | ✅ Functions, classes, methods |
 | Rust | ✅ | ✅ | ✅ Functions, structs, traits |
 | Go | ✅ | ✅ | ✅ Functions, types, methods |
+| Markdown | ✅ | ✅ | ✅ Headings, sections, code blocks |
 | C | ✅ | ✅ | ✅ Functions, structs, enums, unions |
 | C++ | ✅ | ✅ | ✅ Classes, structs, namespaces, templates |
 | Ruby | ✅ | ✅ | ✅ Classes, methods, modules |
@@ -297,7 +299,7 @@ ck --inspect --model bge-small src/main.rs  # Test different models
 | C# | ✅ | ✅ | ✅ Classes, interfaces, methods |
 | Dart | ✅ | ✅ | ✅ Classes, mixins, methods |
 
-**Text Formats:** Markdown, JSON, YAML, TOML, XML, HTML, CSS, shell scripts, SQL, log files, config files, and any other text format.
+**Text Formats:** JSON, YAML, TOML, XML, HTML, CSS, shell scripts, SQL, log files, config files, and any other text format.
 
 **Smart Binary Detection:** Uses ripgrep-style content analysis, automatically indexing any text file while correctly excluding binary files.
 

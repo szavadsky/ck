@@ -142,6 +142,8 @@ pub enum ParseableLanguage {
     Dart,
 
     Elixir,
+
+    Markdown,
 }
 
 impl std::fmt::Display for ParseableLanguage {
@@ -162,6 +164,8 @@ impl std::fmt::Display for ParseableLanguage {
             ParseableLanguage::Dart => "dart",
 
             ParseableLanguage::Elixir => "elixir",
+
+            ParseableLanguage::Markdown => "markdown",
         };
         write!(f, "{}", name)
     }
@@ -187,6 +191,8 @@ impl TryFrom<ck_core::Language> for ParseableLanguage {
             ck_core::Language::Dart => Ok(ParseableLanguage::Dart),
 
             ck_core::Language::Elixir => Ok(ParseableLanguage::Elixir),
+
+            ck_core::Language::Markdown => Ok(ParseableLanguage::Markdown),
 
             _ => Err(anyhow::anyhow!(
                 "Language {:?} is not supported for parsing",
@@ -372,6 +378,11 @@ pub(crate) fn tree_sitter_language(language: ParseableLanguage) -> Result<tree_s
         return Ok(tree_sitter_dart::language());
     }
 
+    // tree-sitter-md v0.2.3 exposes language() instead of LANGUAGE
+    if language == ParseableLanguage::Markdown {
+        return Ok(tree_sitter_md::language().into());
+    }
+
     let ts_language = match language {
         ParseableLanguage::Python => tree_sitter_python::LANGUAGE,
         ParseableLanguage::TypeScript | ParseableLanguage::JavaScript => {
@@ -389,6 +400,9 @@ pub(crate) fn tree_sitter_language(language: ParseableLanguage) -> Result<tree_s
         ParseableLanguage::Dart => unreachable!("Handled above via early return"),
 
         ParseableLanguage::Elixir => tree_sitter_elixir::LANGUAGE,
+
+        ParseableLanguage::Markdown => unreachable!("Handled above via early return"),
+
     };
 
     Ok(ts_language.into())
@@ -867,6 +881,20 @@ fn chunk_type_for_node(
         // Elixir uses "call" nodes for defmodule, def, defp, etc.
         // We handle this specially via query-based chunking
         ParseableLanguage::Elixir => matches!(kind, "call" | "do_block"),
+        ParseableLanguage::Markdown => matches!(
+            kind,
+            "atx_heading"
+                | "setext_heading"
+                | "heading"
+                | "section"
+                | "fenced_code_block"
+                | "indented_code_block"
+                | "block_quote"
+                | "list"
+                | "list_item"
+                | "paragraph"
+                | "thematic_break"
+        ),
     };
 
     if !supported {
@@ -944,7 +972,11 @@ fn classify_chunk_kind(kind: &str) -> ChunkType {
         | "const_declaration"
         | "variable_declaration"
         | "test_declaration"
-        | "comptime_declaration" => ChunkType::Module,
+        | "comptime_declaration"
+        | "atx_heading"
+        | "setext_heading"
+        | "heading"
+        | "section" => ChunkType::Module,
         _ => ChunkType::Text,
     }
 }
@@ -1080,7 +1112,9 @@ fn should_attach_leading_trivia(language: ParseableLanguage, node: &tree_sitter:
         }
         ParseableLanguage::Python => kind == "decorator",
         ParseableLanguage::TypeScript | ParseableLanguage::JavaScript => kind == "decorator",
-        ParseableLanguage::C | ParseableLanguage::Cpp => kind == "comment",
+        ParseableLanguage::C | ParseableLanguage::Cpp | ParseableLanguage::Markdown => {
+            kind == "comment"
+        }
         ParseableLanguage::CSharp => matches!(kind, "attribute_list" | "attribute"),
         _ => false,
     }
@@ -1140,6 +1174,10 @@ fn collect_ancestry(
     language: ParseableLanguage,
     source: &str,
 ) -> Vec<String> {
+    if language == ParseableLanguage::Markdown {
+        return markdown_heading_ancestry(node, source);
+    }
+
     let mut parts = Vec::new();
 
     while let Some(parent) = node.parent() {
@@ -1184,6 +1222,8 @@ fn display_name_for_node(
         ParseableLanguage::CSharp => find_identifier(node, source, &["identifier"]),
         ParseableLanguage::Zig => find_identifier(node, source, &["identifier"]),
 
+        ParseableLanguage::Markdown => markdown_display_name(node, source, chunk_type),
+
         ParseableLanguage::Dart => {
             find_identifier(node, source, &["identifier", "type_identifier"])
         }
@@ -1191,6 +1231,146 @@ fn display_name_for_node(
             // Elixir names can be aliases (module names) or atoms/identifiers
             find_identifier(node, source, &["alias", "identifier", "atom"])
         }
+    }
+}
+
+fn markdown_display_name(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    _chunk_type: ChunkType,
+) -> Option<String> {
+    if node.kind() == "section" {
+        return markdown_section_heading(node, source);
+    }
+
+    if markdown_heading_kind(node.kind()) {
+        return markdown_heading_text(node, source);
+    }
+
+    None
+}
+
+fn markdown_section_heading(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if markdown_heading_kind(child.kind()) {
+            return markdown_heading_text(child, source);
+        }
+    }
+    None
+}
+
+fn markdown_heading_kind(kind: &str) -> bool {
+    matches!(kind, "atx_heading" | "setext_heading" | "heading")
+}
+
+fn markdown_heading_text(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    let text = text_for_node(node, source)?;
+    let mut lines = text.lines();
+    let first_line = lines.next().unwrap_or("");
+
+    if let Some((_, heading)) = parse_atx_heading_line(first_line) {
+        return Some(heading);
+    }
+
+    let second_line = lines.next().unwrap_or("");
+    if parse_setext_level(second_line).is_some() {
+        let trimmed = first_line.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+
+    let trimmed = first_line.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn markdown_heading_ancestry(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
+    let mut target_row = node.start_position().row;
+    if node.kind() == "section" || markdown_heading_kind(node.kind()) {
+        target_row = target_row.saturating_sub(1);
+    }
+    let lines: Vec<&str> = source.lines().collect();
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() && i <= target_row {
+        let line = lines[i];
+
+        if let Some((level, heading)) = parse_atx_heading_line(line) {
+            update_markdown_heading_stack(&mut stack, level, heading);
+            i += 1;
+            continue;
+        }
+
+        if i + 1 < lines.len() && i + 1 <= target_row {
+            let underline = lines[i + 1];
+            if let Some(level) = parse_setext_level(underline) {
+                let heading_text = line.trim();
+                if !heading_text.is_empty() {
+                    update_markdown_heading_stack(
+                        &mut stack,
+                        level,
+                        heading_text.to_string(),
+                    );
+                }
+                i += 2;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    stack.into_iter().map(|(_, heading)| heading).collect()
+}
+
+fn update_markdown_heading_stack(stack: &mut Vec<(usize, String)>, level: usize, text: String) {
+    while let Some((existing_level, _)) = stack.last() {
+        if *existing_level < level {
+            break;
+        }
+        stack.pop();
+    }
+    stack.push((level, text));
+}
+
+fn parse_atx_heading_line(line: &str) -> Option<(usize, String)> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with('#') {
+        return None;
+    }
+
+    let level = trimmed.chars().take_while(|c| *c == '#').count();
+    if level == 0 {
+        return None;
+    }
+
+    let mut text = trimmed[level..].trim();
+    text = text.trim_end_matches('#').trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    Some((level, text.to_string()))
+}
+
+fn parse_setext_level(line: &str) -> Option<usize> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if trimmed.chars().all(|c| c == '=') {
+        Some(1)
+    } else if trimmed.chars().all(|c| c == '-') {
+        Some(2)
+    } else {
+        None
     }
 }
 
@@ -1386,6 +1566,7 @@ fn is_method_context(node: tree_sitter::Node<'_>, language: ParseableLanguage) -
         ParseableLanguage::Dart => ancestor_has_kind(node, DART_CONTAINERS),
 
         ParseableLanguage::Elixir => false, // Elixir doesn't have class-based methods
+        ParseableLanguage::Markdown => false,
     }
 }
 
@@ -2043,6 +2224,82 @@ shapeDescription (Square s) = "square of side " ++ show s
 "#;
 
         assert_query_parity(ParseableLanguage::Haskell, source);
+    }
+
+    #[test]
+    fn test_markdown_real_file_breadcrumbs() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/markdown_breadcrumbs.md");
+        let source = std::fs::read_to_string(&path).expect("read markdown file");
+
+        let chunks = chunk_text(&source, Some(ck_core::Language::Markdown))
+            .expect("chunk markdown");
+
+        let has_heading_chunk =
+            chunks.iter().any(|chunk| chunk.chunk_type == ChunkType::Module);
+        let has_breadcrumb = chunks.iter().any(|chunk| {
+            !chunk.metadata.ancestry.is_empty()
+                && chunk
+                    .metadata
+                    .breadcrumb
+                    .as_ref()
+                    .map(|breadcrumb| !breadcrumb.is_empty())
+                    .unwrap_or(false)
+        });
+
+        assert!(
+            has_heading_chunk,
+            "expected markdown chunking to produce heading/module chunks"
+        );
+
+        assert!(
+            has_breadcrumb,
+            "expected at least one markdown chunk with heading ancestry"
+        );
+    }
+
+    #[test]
+    fn test_markdown_inline_fixtures_cover_blocks() {
+        let source = r#"
+# Title
+
+Intro paragraph with **bold** text.
+
+## Usage
+
+```rust
+fn main() {
+    println!("hi");
+}
+```
+
+> Blockquote with _emphasis_.
+
+- Item one
+- Item two
+
+Setext Section
+==============
+
+Trailing paragraph.
+"#;
+
+        let chunks = chunk_text(&source, Some(ck_core::Language::Markdown))
+            .expect("chunk markdown");
+
+        let has_heading_chunk =
+            chunks.iter().any(|chunk| chunk.chunk_type == ChunkType::Module);
+        let has_code_block = chunks.iter().any(|chunk| chunk.text.contains("```rust"));
+        let has_blockquote = chunks.iter().any(|chunk| chunk.text.contains("> Blockquote"));
+        let has_setext = chunks.iter().any(|chunk| chunk.text.contains("Setext Section"));
+
+        assert!(
+            has_heading_chunk,
+            "expected markdown chunking to produce heading/module chunks"
+        );
+        assert!(has_code_block, "expected markdown to include fenced code block");
+        assert!(has_blockquote, "expected markdown to include blockquote text");
+        assert!(has_setext, "expected markdown to include Setext heading text");
     }
 
     #[test]
