@@ -88,6 +88,8 @@ fn builtin_query(language: ParseableLanguage) -> Option<&'static str> {
         ParseableLanguage::Haskell => Some(include_str!("../queries/haskell/tags.scm")),
         ParseableLanguage::Ruby => Some(include_str!("../queries/ruby/tags.scm")),
         ParseableLanguage::Go => Some(include_str!("../queries/go/tags.scm")),
+        ParseableLanguage::C => Some(include_str!("../queries/c/tags.scm")),
+        ParseableLanguage::Cpp => Some(include_str!("../queries/cpp/tags.scm")),
         ParseableLanguage::CSharp => Some(include_str!("../queries/csharp/tags.scm")),
         ParseableLanguage::Zig => Some(include_str!("../queries/zig/tags.scm")),
 
@@ -362,5 +364,225 @@ const int MAX = 100;
         if let Some(func) = global_func {
             println!("Global Func Metadata: {:?}", func.metadata);
         }
+    }
+
+    #[test]
+    fn c_queries_capture_core_constructs() {
+        let source = r#"
+#include <stdio.h>
+
+#define MAX_SIZE 1024
+
+#define SQUARE(x) ((x) * (x))
+
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+struct Node {
+    int value;
+    struct Node* next;
+};
+
+enum Color {
+    RED,
+    GREEN,
+    BLUE
+};
+
+union Data {
+    int i;
+    float f;
+};
+
+void helper(int n) {
+    printf("%d\n", n);
+}
+
+int compute(int a, int b) {
+    return a + b;
+}
+"#;
+
+        let mut parser = Parser::new();
+        let ts_language = tree_sitter_language(ParseableLanguage::C).expect("c language");
+        parser.set_language(&ts_language).expect("set c language");
+        let tree = parser.parse(source, None).expect("parse c source");
+
+        let chunks = chunk_with_queries(ParseableLanguage::C, ts_language, &tree, source)
+            .expect("query execution")
+            .expect("query should be available");
+
+        // Check function captures
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Function
+                    && chunk.text.contains("void helper")),
+            "Should capture helper function"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Function
+                    && chunk.text.contains("int compute")),
+            "Should capture compute function"
+        );
+
+        // Check struct capture
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Class
+                    && chunk.text.contains("struct Node")),
+            "Should capture struct Node"
+        );
+
+        // Check enum capture
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Class
+                    && chunk.text.contains("enum Color")),
+            "Should capture enum Color"
+        );
+
+        // Check union capture
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Class
+                    && chunk.text.contains("union Data")),
+            "Should capture union Data"
+        );
+
+        // Check macro function capture
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Function
+                    && chunk.text.contains("SQUARE")),
+            "Should capture SQUARE macro function"
+        );
+
+        // Verify top-level function has empty ancestry
+        let compute_chunk = chunks
+            .iter()
+            .find(|chunk| {
+                chunk.chunk_type == ChunkType::Function && chunk.text.contains("int compute")
+            })
+            .expect("compute chunk present");
+        assert!(compute_chunk.metadata.ancestry.is_empty());
+    }
+
+    #[test]
+    fn cpp_queries_capture_core_constructs() {
+        let source = r#"
+#include <iostream>
+#include <string>
+
+#define MAX_ITEMS 256
+
+namespace utils {
+
+class Calculator {
+public:
+    Calculator() {}
+
+    int add(int a, int b) {
+        return a + b;
+    }
+
+    virtual int multiply(int a, int b) {
+        return a * b;
+    }
+};
+
+struct Point {
+    double x;
+    double y;
+};
+
+enum class Color {
+    Red,
+    Green,
+    Blue
+};
+
+} // namespace utils
+
+template <typename T>
+T identity(T value) {
+    return value;
+}
+
+void global_func() {
+    std::cout << "hello" << std::endl;
+}
+"#;
+
+        let mut parser = Parser::new();
+        let ts_language = tree_sitter_language(ParseableLanguage::Cpp).expect("cpp language");
+        parser.set_language(&ts_language).expect("set cpp language");
+        let tree = parser.parse(source, None).expect("parse cpp source");
+
+        let chunks = chunk_with_queries(ParseableLanguage::Cpp, ts_language, &tree, source)
+            .expect("query execution")
+            .expect("query should be available");
+
+        // Check class capture
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Class
+                    && chunk.text.contains("class Calculator")),
+            "Should capture class Calculator"
+        );
+
+        // Check struct capture
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Class
+                    && chunk.text.contains("struct Point")),
+            "Should capture struct Point"
+        );
+
+        // Check enum class capture
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Class
+                    && chunk.text.contains("enum class Color")),
+            "Should capture enum class Color"
+        );
+
+        // Check namespace capture
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Module
+                    && chunk.text.contains("namespace utils")),
+            "Should capture namespace utils"
+        );
+
+        // Check global function
+        assert!(
+            chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Function
+                    && chunk.text.contains("void global_func")),
+            "Should capture global_func"
+        );
+
+        // Verify top-level function has empty ancestry
+        let global_func = chunks
+            .iter()
+            .find(|chunk| {
+                chunk.chunk_type == ChunkType::Function && chunk.text.contains("void global_func")
+            })
+            .expect("global_func chunk present");
+        assert!(global_func.metadata.ancestry.is_empty());
     }
 }

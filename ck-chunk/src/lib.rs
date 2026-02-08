@@ -134,6 +134,8 @@ pub enum ParseableLanguage {
     Rust,
     Ruby,
     Go,
+    C,
+    Cpp,
     CSharp,
     Zig,
 
@@ -152,6 +154,8 @@ impl std::fmt::Display for ParseableLanguage {
             ParseableLanguage::Rust => "rust",
             ParseableLanguage::Ruby => "ruby",
             ParseableLanguage::Go => "go",
+            ParseableLanguage::C => "c",
+            ParseableLanguage::Cpp => "cpp",
             ParseableLanguage::CSharp => "csharp",
             ParseableLanguage::Zig => "zig",
 
@@ -175,6 +179,8 @@ impl TryFrom<ck_core::Language> for ParseableLanguage {
             ck_core::Language::Rust => Ok(ParseableLanguage::Rust),
             ck_core::Language::Ruby => Ok(ParseableLanguage::Ruby),
             ck_core::Language::Go => Ok(ParseableLanguage::Go),
+            ck_core::Language::C => Ok(ParseableLanguage::C),
+            ck_core::Language::Cpp => Ok(ParseableLanguage::Cpp),
             ck_core::Language::CSharp => Ok(ParseableLanguage::CSharp),
             ck_core::Language::Zig => Ok(ParseableLanguage::Zig),
 
@@ -375,6 +381,8 @@ pub(crate) fn tree_sitter_language(language: ParseableLanguage) -> Result<tree_s
         ParseableLanguage::Rust => tree_sitter_rust::LANGUAGE,
         ParseableLanguage::Ruby => tree_sitter_ruby::LANGUAGE,
         ParseableLanguage::Go => tree_sitter_go::LANGUAGE,
+        ParseableLanguage::C => tree_sitter_c::LANGUAGE,
+        ParseableLanguage::Cpp => tree_sitter_cpp::LANGUAGE,
         ParseableLanguage::CSharp => tree_sitter_c_sharp::LANGUAGE,
         ParseableLanguage::Zig => tree_sitter_zig::LANGUAGE,
 
@@ -797,6 +805,32 @@ fn chunk_type_for_node(
                 | "var_declaration"
                 | "const_declaration"
         ),
+        ParseableLanguage::C => matches!(
+            kind,
+            "function_definition"
+                | "struct_specifier"
+                | "enum_specifier"
+                | "union_specifier"
+                | "type_definition"
+                | "declaration"
+                | "preproc_function_def"
+                | "preproc_def"
+        ),
+        ParseableLanguage::Cpp => matches!(
+            kind,
+            "function_definition"
+                | "class_specifier"
+                | "struct_specifier"
+                | "enum_specifier"
+                | "union_specifier"
+                | "namespace_definition"
+                | "template_declaration"
+                | "type_definition"
+                | "alias_declaration"
+                | "declaration"
+                | "preproc_function_def"
+                | "preproc_def"
+        ),
         ParseableLanguage::CSharp => matches!(
             kind,
             "method_declaration"
@@ -869,7 +903,8 @@ fn classify_chunk_kind(kind: &str) -> ChunkType {
         | "defn"
         | "defn-"
         | "method"
-        | "singleton_method" => ChunkType::Function,
+        | "singleton_method"
+        | "preproc_function_def" => ChunkType::Function,
         "signature" => ChunkType::Function, // Haskell type signatures will be merged with functions
         "class_definition"
         | "class_declaration"
@@ -878,6 +913,10 @@ fn classify_chunk_kind(kind: &str) -> ChunkType {
         | "instance"
         | "struct_item"
         | "enum_item"
+        | "class_specifier"
+        | "struct_specifier"
+        | "enum_specifier"
+        | "union_specifier"
         | "defstruct"
         | "defrecord"
         | "deftype"
@@ -895,6 +934,7 @@ fn classify_chunk_kind(kind: &str) -> ChunkType {
         | "impl_item"
         | "trait_item"
         | "mod_item"
+        | "namespace_definition"
         | "defmodule"
         | "module"
         | "defprotocol"
@@ -1040,6 +1080,7 @@ fn should_attach_leading_trivia(language: ParseableLanguage, node: &tree_sitter:
         }
         ParseableLanguage::Python => kind == "decorator",
         ParseableLanguage::TypeScript | ParseableLanguage::JavaScript => kind == "decorator",
+        ParseableLanguage::C | ParseableLanguage::Cpp => kind == "comment",
         ParseableLanguage::CSharp => matches!(kind, "attribute_list" | "attribute"),
         _ => false,
     }
@@ -1138,6 +1179,8 @@ fn display_name_for_node(
         }
         ParseableLanguage::Ruby => find_identifier(node, source, &["identifier"]),
         ParseableLanguage::Go => find_identifier(node, source, &["identifier", "type_identifier"]),
+        ParseableLanguage::C => c_display_name(node, source, chunk_type),
+        ParseableLanguage::Cpp => cpp_display_name(node, source, chunk_type),
         ParseableLanguage::CSharp => find_identifier(node, source, &["identifier"]),
         ParseableLanguage::Zig => find_identifier(node, source, &["identifier"]),
 
@@ -1184,6 +1227,80 @@ fn rust_display_name(
         }
         _ => find_identifier(node, source, &["identifier", "type_identifier"]),
     }
+}
+
+fn c_display_name(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    _chunk_type: ChunkType,
+) -> Option<String> {
+    match node.kind() {
+        "function_definition" => {
+            // C function: look for the declarator, then the identifier inside it
+            if let Some(declarator) = node.child_by_field_name("declarator") {
+                return find_identifier_recursive(declarator, source, &["identifier"]);
+            }
+            None
+        }
+        "struct_specifier" | "enum_specifier" | "union_specifier" => {
+            find_identifier(node, source, &["type_identifier", "identifier"])
+        }
+        "type_definition" => find_identifier(node, source, &["type_identifier", "identifier"]),
+        "preproc_function_def" | "preproc_def" => find_identifier(node, source, &["identifier"]),
+        _ => find_identifier(node, source, &["identifier", "type_identifier"]),
+    }
+}
+
+fn cpp_display_name(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    _chunk_type: ChunkType,
+) -> Option<String> {
+    match node.kind() {
+        "function_definition" => {
+            if let Some(declarator) = node.child_by_field_name("declarator") {
+                return find_identifier_recursive(
+                    declarator,
+                    source,
+                    &[
+                        "identifier",
+                        "field_identifier",
+                        "destructor_name",
+                        "qualified_identifier",
+                    ],
+                );
+            }
+            None
+        }
+        "class_specifier" | "struct_specifier" | "enum_specifier" | "union_specifier" => {
+            find_identifier(node, source, &["type_identifier", "identifier"])
+        }
+        "namespace_definition" => {
+            find_identifier(node, source, &["identifier", "namespace_identifier"])
+        }
+        "template_declaration" | "alias_declaration" | "type_definition" => {
+            find_identifier(node, source, &["type_identifier", "identifier"])
+        }
+        _ => find_identifier(node, source, &["identifier", "type_identifier"]),
+    }
+}
+
+/// Recursively search for an identifier in nested declarators (e.g., C function declarators)
+fn find_identifier_recursive(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    candidate_kinds: &[&str],
+) -> Option<String> {
+    if candidate_kinds.contains(&node.kind()) {
+        return text_for_node(node, source).map(|s| s.trim().to_string());
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(result) = find_identifier_recursive(child, source, candidate_kinds) {
+            return Some(result);
+        }
+    }
+    None
 }
 
 fn find_identifier(
@@ -1260,6 +1377,8 @@ fn is_method_context(node: tree_sitter::Node<'_>, language: ParseableLanguage) -
         ParseableLanguage::Ruby => ancestor_has_kind(node, RUBY_CONTAINERS),
         ParseableLanguage::Rust => ancestor_has_kind(node, RUST_CONTAINERS),
         ParseableLanguage::Go => false,
+        ParseableLanguage::C => ancestor_has_kind(node, &["struct_specifier"]),
+        ParseableLanguage::Cpp => ancestor_has_kind(node, &["class_specifier", "struct_specifier"]),
         ParseableLanguage::CSharp => false,
         ParseableLanguage::Haskell => false,
         ParseableLanguage::Zig => false,
