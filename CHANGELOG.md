@@ -324,7 +324,7 @@ Thanks to the following contributors for this release:
 ### Improved
 - **Enhanced UX for semantic search**: Added intelligent defaults (topk=10, threshold=0.6) for semantic search to reduce cognitive load
 - **Better CLI discoverability**: Added `--limit` as intuitive alias for `--topk` flag
-- **Improved help documentation**: Clear signposting of relevant flags with aligned messaging across examples and descriptions  
+- **Improved help documentation**: Clear signposting of relevant flags with aligned messaging across examples and descriptions
 - **Informational output**: Semantic search now shows current parameters (e.g., "ℹ Semantic search: top 10 results, threshold ≥0.6")
 - **Consistent flag documentation**: Help text now clearly shows defaults and relationships between flags
 
@@ -343,7 +343,7 @@ Thanks to the following contributors for this release:
 - **Improved error handling**: Enhanced directory traversal error handling and graceful degradation for individual file failures
 - **Incremental indexing**: Smart hash-based index updates that only reprocess changed files, dramatically improving index update performance
 
-### Improved  
+### Improved
 - **Indexing strategy optimization**: Smart embedding computation that only processes embeddings when needed for semantic/hybrid search, dramatically improving performance for regex-only workflows
 - **Semantic search v3**: New implementation using pre-computed embeddings from sidecar files with span-based content extraction
 - **Test infrastructure**: Enhanced integration tests with better binary path resolution and more resilient semantic search testing
