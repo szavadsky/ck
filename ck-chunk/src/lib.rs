@@ -448,6 +448,7 @@ fn chunk_language(text: &str, language: ParseableLanguage) -> Result<Vec<Chunk>>
     if language == ParseableLanguage::Markdown {
         let (target_tokens, _) = get_model_chunk_config(None);
         chunks = merge_small_chunks(chunks, text, target_tokens);
+    }
     // Merge template-prefix gap chunks into the following C++ definition chunk
     if language == ParseableLanguage::Cpp {
         chunks = merge_cpp_template_prefix_chunks(chunks, text);
