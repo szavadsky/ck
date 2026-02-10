@@ -30,6 +30,68 @@ pub(crate) fn chunk_with_queries(
         for capture in mat.captures {
             let capture_name = &capture_names[capture.index as usize];
             if let Some(chunk_type) = chunk_type_from_capture(capture_name) {
+                // Filter out duplicates for C/C++ where template_declaration wraps the definition
+                if matches!(language, ParseableLanguage::C | ParseableLanguage::Cpp) {
+                    if let Some(parent) = capture.node.parent() {
+                        if parent.kind() == "template_declaration"
+                            && matches!(chunk_type, ChunkType::Class | ChunkType::Function | ChunkType::Method)
+                        {
+                            continue;
+                        }
+                    }
+
+                    if chunk_type == ChunkType::Class
+                        && matches!(
+                            capture.node.kind(),
+                            "struct_specifier" | "union_specifier" | "enum_specifier"
+                        )
+                        && !c_cpp_type_has_body(capture.node)
+                    {
+                        continue;
+                    }
+
+                    // Filter out granular text chunks (using, typedef, locals, etc.) inside
+                    // classes/structs/unions or inside function/method bodies.
+                    if matches!(language, ParseableLanguage::C | ParseableLanguage::Cpp)
+                        && chunk_type == ChunkType::Text
+                        && is_inside_c_cpp_type_or_function_body(capture.node)
+                    {
+                        continue;
+                    }
+
+                    // Filter out text chunks that come from declarations inside function bodies
+                    if chunk_type == ChunkType::Text && is_inside_function_or_method(capture.node) {
+                        continue;
+                    }
+
+                    // Skip local class/struct/enum/union chunks inside functions
+                    if chunk_type == ChunkType::Class && is_inside_function_or_method(capture.node) {
+                        continue;
+                    }
+
+                    // Skip local function/method chunks inside functions (e.g., local classes)
+                    if matches!(chunk_type, ChunkType::Function | ChunkType::Method)
+                        && is_inside_function_or_method(capture.node)
+                    {
+                        continue;
+                    }
+
+                    // Skip C/C++ function/method declarations without bodies (defaulted/deleted)
+                    if matches!(chunk_type, ChunkType::Function | ChunkType::Method)
+                        && capture.node.kind() == "function_definition"
+                        && !has_compound_statement(capture.node)
+                    {
+                        continue;
+                    }
+
+                    // Avoid declaration-wrapped duplicates that contain full definitions
+                    if capture.node.kind() == "declaration"
+                        && declaration_contains_definition(capture.node)
+                    {
+                        continue;
+                    }
+                }
+
                 if language == ParseableLanguage::Haskell
                     && chunk_type == ChunkType::Function
                     && capture
@@ -56,6 +118,87 @@ pub(crate) fn chunk_with_queries(
 
     chunks.sort_by_key(|chunk| chunk.span.byte_start);
     Ok(Some(chunks))
+}
+
+fn is_inside_c_cpp_type_or_function_body(mut node: tree_sitter::Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "class_specifier" | "struct_specifier" | "union_specifier" => return true,
+            "function_definition" | "method_definition" => return true,
+            _ => {}
+        }
+        node = parent;
+    }
+    false
+}
+
+fn is_inside_function_or_method(mut node: tree_sitter::Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "function_definition"
+            | "method_definition"
+            | "constructor_definition"
+            | "destructor_definition"
+            | "lambda_expression" => return true,
+            _ => {}
+        }
+        node = parent;
+    }
+    false
+}
+
+fn declaration_contains_definition(node: tree_sitter::Node<'_>) -> bool {
+    let mut stack = vec![node];
+
+    while let Some(current) = stack.pop() {
+        if matches!(
+            current.kind(),
+            "class_specifier"
+                | "struct_specifier"
+                | "enum_specifier"
+                | "union_specifier"
+                | "function_definition"
+                | "method_definition"
+                | "constructor_definition"
+                | "destructor_definition"
+        ) {
+            return true;
+        }
+
+        let child_count = current.child_count();
+        for idx in (0..child_count).rev() {
+            if let Some(child) = current.child(idx) {
+                stack.push(child);
+            }
+        }
+    }
+
+    false
+}
+
+fn has_compound_statement(node: tree_sitter::Node<'_>) -> bool {
+    for idx in 0..node.child_count() {
+        if let Some(child) = node.child(idx) {
+            if child.kind() == "compound_statement" {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn c_cpp_type_has_body(node: tree_sitter::Node<'_>) -> bool {
+    let mut cursor = node.walk();
+
+    match node.kind() {
+        "struct_specifier" | "union_specifier" => node
+            .children(&mut cursor)
+            .any(|child| child.kind() == "field_declaration_list"),
+        "enum_specifier" => node
+            .children(&mut cursor)
+            .any(|child| child.kind() == "enumerator_list"),
+        _ => false,
+    }
 }
 
 fn load_query_source(language: ParseableLanguage) -> Result<Option<Cow<'static, str>>> {
@@ -108,7 +251,7 @@ fn chunk_type_from_capture(name: &str) -> Option<ChunkType> {
         "function" | "fn" => Some(ChunkType::Function),
         "method" => Some(ChunkType::Method),
         "class" | "struct" | "enum" | "trait" => Some(ChunkType::Class),
-        "module" | "namespace" | "impl" | "mod" => Some(ChunkType::Module),
+        "module" | "impl" | "mod" => Some(ChunkType::Module),
         // Module attributes (Elixir @spec, @type, @callback, @behaviour)
         "spec" | "type" | "callback" | "behaviour" => Some(ChunkType::Text),
         "text" | "import" => Some(ChunkType::Text),
@@ -443,6 +586,10 @@ union Data {
     float f;
 };
 
+struct Node node_instance;
+union Data data_instance;
+enum Color color_instance;
+
 void helper(int n) {
     printf("%d\n", n);
 }
@@ -502,6 +649,29 @@ int compute(int a, int b) {
                 .any(|chunk| chunk.chunk_type == ChunkType::Class
                     && chunk.text.contains("union Data")),
             "Should capture union Data"
+        );
+
+        // Ensure bodyless type specifiers are not captured
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Class
+                    && chunk.text.contains("node_instance")),
+            "Should not capture struct declarations without bodies"
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Class
+                    && chunk.text.contains("data_instance")),
+            "Should not capture union declarations without bodies"
+        );
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| chunk.chunk_type == ChunkType::Class
+                    && chunk.text.contains("color_instance")),
+            "Should not capture enum declarations without bodies"
         );
 
         // Check macro function capture
@@ -605,15 +775,6 @@ void global_func() {
             "Should capture enum class Color"
         );
 
-        // Check namespace capture
-        assert!(
-            chunks
-                .iter()
-                .any(|chunk| chunk.chunk_type == ChunkType::Module
-                    && chunk.text.contains("namespace utils")),
-            "Should capture namespace utils"
-        );
-
         // Check global function
         assert!(
             chunks
@@ -631,5 +792,199 @@ void global_func() {
             })
             .expect("global_func chunk present");
         assert!(global_func.metadata.ancestry.is_empty());
+    }
+
+    #[test]
+    fn cpp_queries_skip_function_body_declarations() {
+        let source = r#"
+int compute(int base) {
+    int local = base + 1;
+    if (auto value = base * 2; value > 0) {
+        return value;
+    }
+    return local;
+}
+"#;
+
+        let mut parser = Parser::new();
+        let ts_language = tree_sitter_language(ParseableLanguage::Cpp).expect("cpp language");
+        parser.set_language(&ts_language).expect("set cpp language");
+        let tree = parser.parse(source, None).expect("parse cpp source");
+
+        let chunks = chunk_with_queries(ParseableLanguage::Cpp, ts_language, &tree, source)
+            .expect("query execution")
+            .expect("query should be available");
+
+        assert!(chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Function && chunk.text.contains("int compute")
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Text && chunk.text.contains("int local")
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Text && chunk.text.contains("auto value")
+        }));
+    }
+
+    #[test]
+    fn cpp_queries_skip_local_class_in_function() {
+        let source = r#"
+void build() {
+    struct Temp {
+        int value;
+    };
+    Temp temp{42};
+}
+"#;
+
+        let mut parser = Parser::new();
+        let ts_language = tree_sitter_language(ParseableLanguage::Cpp).expect("cpp language");
+        parser.set_language(&ts_language).expect("set cpp language");
+        let tree = parser.parse(source, None).expect("parse cpp source");
+
+        let chunks = chunk_with_queries(ParseableLanguage::Cpp, ts_language, &tree, source)
+            .expect("query execution")
+            .expect("query should be available");
+
+        assert!(chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Function && chunk.text.contains("void build")
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Class && chunk.text.contains("struct Temp")
+        }));
+    }
+
+    #[test]
+    fn cpp_queries_namespace_ancestry_for_class() {
+        let source = r#"
+namespace outer {
+namespace inner {
+class Widget {
+public:
+    void run() {}
+};
+} // namespace inner
+} // namespace outer
+"#;
+
+        let mut parser = Parser::new();
+        let ts_language = tree_sitter_language(ParseableLanguage::Cpp).expect("cpp language");
+        parser.set_language(&ts_language).expect("set cpp language");
+        let tree = parser.parse(source, None).expect("parse cpp source");
+
+        let chunks = chunk_with_queries(ParseableLanguage::Cpp, ts_language, &tree, source)
+            .expect("query execution")
+            .expect("query should be available");
+
+        let class_chunk = chunks
+            .iter()
+            .find(|chunk| chunk.chunk_type == ChunkType::Class && chunk.text.contains("class Widget"))
+            .expect("class chunk present");
+        assert_eq!(
+            class_chunk.metadata.ancestry,
+            vec!["outer".to_string(), "inner".to_string()]
+        );
+    }
+
+    #[test]
+    fn cpp_queries_skip_defaulted_deleted_ctors() {
+        let source = r#"
+class Sample {
+public:
+    Sample() = default;
+    Sample(const Sample&) = delete;
+};
+"#;
+
+        let mut parser = Parser::new();
+        let ts_language = tree_sitter_language(ParseableLanguage::Cpp).expect("cpp language");
+        parser.set_language(&ts_language).expect("set cpp language");
+        let tree = parser.parse(source, None).expect("parse cpp source");
+
+        let chunks = chunk_with_queries(ParseableLanguage::Cpp, ts_language, &tree, source)
+            .expect("query execution")
+            .expect("query should be available");
+
+        assert!(chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Class && chunk.text.contains("class Sample")
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Text
+                && (chunk.text.contains("= default") || chunk.text.contains("= delete"))
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Method
+                && (chunk.text.contains("= default") || chunk.text.contains("= delete"))
+        }));
+    }
+
+    #[test]
+    fn cpp_queries_drop_text_inside_types_and_functions() {
+        let source = r#"
+template <typename T>
+class Box {
+  using Value = T;
+  T get() { T local{}; return local; }
+};
+
+using Outside = int;
+
+template <typename T>
+T make(T value) { T inner = value; return inner; }
+"#;
+
+        let mut parser = Parser::new();
+        let ts_language = tree_sitter_language(ParseableLanguage::Cpp).expect("cpp language");
+        parser.set_language(&ts_language).expect("set cpp language");
+        let tree = parser.parse(source, None).expect("parse cpp source");
+
+        let chunks = chunk_with_queries(ParseableLanguage::Cpp, ts_language, &tree, source)
+            .expect("query execution")
+            .expect("query should be available");
+
+        assert!(chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Class && chunk.text.contains("class Box")
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Function && chunk.text.contains("T make")
+        }));
+        assert!(chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Text && chunk.text.contains("using Outside")
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Text && chunk.text.contains("using Value")
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Text && chunk.text.contains("T local")
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Text && chunk.text.contains("T inner")
+        }));
+    }
+
+    #[test]
+    fn cpp_queries_no_declaration_dup_for_class() {
+        let source = r#"
+class DupCheck {
+public:
+    void run() {}
+};
+"#;
+
+        let mut parser = Parser::new();
+        let ts_language = tree_sitter_language(ParseableLanguage::Cpp).expect("cpp language");
+        parser.set_language(&ts_language).expect("set cpp language");
+        let tree = parser.parse(source, None).expect("parse cpp source");
+
+        let chunks = chunk_with_queries(ParseableLanguage::Cpp, ts_language, &tree, source)
+            .expect("query execution")
+            .expect("query should be available");
+
+        assert!(chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Class && chunk.text.contains("class DupCheck")
+        }));
+        assert!(!chunks.iter().any(|chunk| {
+            chunk.chunk_type == ChunkType::Text && chunk.text.contains("class DupCheck")
+        }));
     }
 }

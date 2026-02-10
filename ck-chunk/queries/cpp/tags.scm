@@ -9,11 +9,30 @@
 (enum_specifier) @definition.enum
 (union_specifier) @definition.class
 
-; Namespaces
-(namespace_definition) @module.namespace
-
 ; Templates
-(template_declaration) @definition.text
+(template_declaration
+  (class_specifier)
+) @definition.class
+
+(template_declaration
+  (struct_specifier)
+) @definition.struct
+
+(template_declaration
+  (union_specifier)
+) @definition.class
+
+(template_declaration
+  (enum_specifier)
+) @definition.enum
+
+(template_declaration
+  (function_definition)
+) @definition.function
+
+(template_declaration
+  (alias_declaration)
+) @definition.text
 
 ; Typedefs and type aliases
 (type_definition) @definition.text
