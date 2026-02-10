@@ -9,6 +9,11 @@ use owo_colors::{OwoColorize, Rgb};
 use regex::RegexBuilder;
 use std::path::{Path, PathBuf};
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 mod mcp;
 mod mcp_server;
 mod path_utils;
