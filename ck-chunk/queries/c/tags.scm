@@ -8,9 +8,7 @@
 (enum_specifier) @definition.enum
 (union_specifier) @definition.class
 
-; Typedefs and declarations
-(type_definition) @definition.text
-(declaration) @definition.text
+
 
 ; Preprocessor macros
 (preproc_function_def) @definition.function
