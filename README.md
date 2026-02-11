@@ -317,6 +317,9 @@ cargo install ck-search
 git clone https://github.com/BeaconBay/ck
 cd ck
 cargo install --path ck-cli
+
+# CPU-only build (no GPU acceleration)
+cargo install --path ck-cli --features cpu-only
 ```
 
 ### Package Managers
@@ -390,6 +393,74 @@ ck --json --sem "public API" src/ | generate_docs.py
 - **Index size:** ~2x source code size with compression
 - **Memory:** Efficient streaming for large repositories
 - **Token precision:** HuggingFace tokenizers for exact model-specific token counting
+
+## ⚡ Hardware Acceleration
+
+ck automatically detects and benchmarks available hardware acceleration for embedding inference. On first semantic search, it tests all compiled execution providers and caches the fastest one.
+
+### Supported Providers
+
+| Provider | Platform | Requirements |
+|----------|----------|-------------|
+| CUDA | Linux x86_64, Windows x86_64 | NVIDIA GPU + CUDA Toolkit 12.x |
+| TensorRT | Linux x86_64, Windows x86_64 | NVIDIA GPU + TensorRT 8.x+ |
+| ROCm | Linux x86_64 | AMD GPU + ROCm 5.x+ |
+| OpenVINO | Linux x86_64, Windows x86_64 | Intel CPU/GPU + OpenVINO Runtime |
+| CoreML | macOS (Apple Silicon) | Built-in, no extra dependencies |
+| DirectML | Windows | Built-in on Windows 10+ |
+| CPU | All platforms | Always available (fallback) |
+
+### System Dependencies
+
+**Linux (NVIDIA CUDA/TensorRT):**
+```bash
+# Ubuntu/Debian
+sudo apt install nvidia-driver-550 cuda-toolkit-12-4
+
+# Optional: TensorRT for maximum NVIDIA performance
+sudo apt install libnvinfer-dev
+```
+
+**Linux (AMD ROCm):**
+```bash
+sudo apt install rocm-smi rocm-opencl-runtime
+```
+
+**Linux (Intel OpenVINO):**
+```bash
+sudo apt install openvino
+```
+
+**macOS:**
+No extra dependencies — CoreML is built into macOS.
+
+**Windows:**
+- CUDA: Install from https://developer.nvidia.com/cuda-downloads
+- DirectML: Built into Windows 10+ (no installation needed)
+
+### Benchmark Commands
+
+```bash
+# Run benchmark (happens automatically on first semantic search)
+ck --rebenchmark
+
+# View cached benchmark results
+ck --show-benchmark
+
+# Force a specific provider (skip benchmarking)
+CK_FORCE_PROVIDER=cuda ck --sem "query" src/
+
+# Build with CPU-only (disable all accelerators)
+cargo install ck-search --features cpu-only
+```
+
+### How It Works
+
+1. On first semantic search, ck tests all compiled execution providers
+2. Each provider runs 5 warmup + 20 measurement iterations
+3. The fastest provider (lowest total workload time) is selected
+4. Results are cached in `~/.cache/ck/benchmarks/` for 30 days
+5. Cache auto-invalidates when GPU hardware or drivers change
 
 ## 🔧 Architecture
 

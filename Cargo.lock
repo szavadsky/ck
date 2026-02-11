@@ -449,13 +449,16 @@ dependencies = [
  "anyhow",
  "ck-core",
  "ck-models",
+ "dirs 5.0.1",
  "fastembed",
  "hf-hub",
+ "md5",
  "ndarray",
  "num_cpus",
  "once_cell",
  "ort",
  "serde",
+ "serde_json",
  "tokenizers 0.20.4",
  "tokio",
 ]
@@ -536,6 +539,7 @@ dependencies = [
  "console",
  "crossterm",
  "dirs 5.0.1",
+ "fastembed",
  "glob",
  "globset",
  "indicatif",
@@ -1994,6 +1998,12 @@ dependencies = [
  "cfg-if",
  "digest",
 ]
+
+[[package]]
+name = "md5"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490cc448043f947bae3cbee9c203358d62dbee0db12107a74be5c30ccfd09771"
 
 [[package]]
 name = "measure_time"
