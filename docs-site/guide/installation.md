@@ -333,6 +333,60 @@ Read the full [Choosing an Interface](/guide/choosing-interface) guide for detai
 - Set up [MCP integration](/features/mcp-integration)
 - Check the [CLI reference](/reference/cli)
 
+## Hardware Acceleration
+
+ck automatically benchmarks available hardware accelerators and selects the fastest one. No configuration needed — just install the appropriate system libraries.
+
+### Linux (NVIDIA GPU)
+
+```bash
+# Install CUDA toolkit (required for CUDA/TensorRT providers)
+sudo apt install nvidia-driver-550 cuda-toolkit-12-4
+
+# Optional: TensorRT for maximum performance
+sudo apt install libnvinfer-dev
+```
+
+### Linux (AMD GPU)
+
+```bash
+# Install ROCm runtime
+sudo apt install rocm-smi rocm-opencl-runtime
+```
+
+### Linux (Intel CPU/GPU)
+
+```bash
+# Install OpenVINO
+sudo apt install openvino
+```
+
+### macOS
+
+No extra dependencies needed. CoreML acceleration is built into macOS and used automatically on Apple Silicon.
+
+### Windows
+
+- **NVIDIA GPU**: Install [CUDA Toolkit](https://developer.nvidia.com/cuda-downloads)
+- **Any GPU**: DirectML is built into Windows 10+ (no installation)
+
+### Verifying Acceleration
+
+```bash
+# Run a benchmark to see which providers are available
+ck --rebenchmark
+
+# View results
+ck --show-benchmark
+
+# Force CPU-only (useful for debugging)
+CK_FORCE_PROVIDER=cpu ck --sem "query" src/
+```
+
+::: tip
+Benchmark results are cached for 30 days. If you install new drivers or change GPUs, run `ck --rebenchmark` to update.
+:::
+
 ## Troubleshooting
 
 ### First Index Takes Long

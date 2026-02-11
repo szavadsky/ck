@@ -59,11 +59,13 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 sha2 = { workspace = true }
 dirs = "5.0"
+fastembed = { workspace = true, optional = true }
 
 [features]
 default = ["fastembed", "mixedbread"]
-fastembed = ["ck-embed/fastembed", "ck-index/fastembed", "ck-engine/fastembed", "ck-chunk/fastembed", "ck-tui/fastembed"]
+fastembed = ["dep:fastembed", "ck-embed/fastembed", "ck-index/fastembed", "ck-engine/fastembed", "ck-chunk/fastembed", "ck-tui/fastembed"]
 mixedbread = ["ck-embed/mixedbread", "ck-index/mixedbread", "ck-engine/mixedbread", "ck-chunk/mixedbread", "ck-tui/mixedbread"]
+cpu-only = ["ck-embed/cpu-only"]
 vendored-openssl = ["openssl?/vendored"]
 
 [dev-dependencies]

@@ -28,13 +28,13 @@ QUICK START EXAMPLES:
 
   Basic grep-style search (no indexing required):
     ck "error" src/                    # Find text matches
-    ck -i "TODO" .                     # Case-insensitive search  
+    ck -i "TODO" .                     # Case-insensitive search
     ck -r "fn main" .                  # Recursive search
     ck -n "import" lib.py              # Show line numbers
 
   Semantic search (finds conceptually similar code):
     ck --sem "error handling" src/     # Builds/updates the index automatically (top 10, threshold ≥0.6)
-    ck --sem "database connection"     # Find DB-related code  
+    ck --sem "database connection"     # Find DB-related code
     ck --sem --limit 5 "authentication"    # Limit to top 5 results
     ck --sem --threshold 0.8 "auth"   # Higher precision filtering
 
@@ -42,7 +42,7 @@ QUICK START EXAMPLES:
     ck --lex "user authentication"    # Full-text search with ranking
     ck --lex "http client request"    # Better than regex for phrases
 
-  Hybrid search (combines regex + semantic):  
+  Hybrid search (combines regex + semantic):
     ck --hybrid "async function"      # Best of both worlds
     ck --hybrid "error" --limit 10    # Top 10 most relevant results (--limit is alias for --topk)
     ck --hybrid "bug" --threshold 0.02 # Only results with RRF score >= 0.02
@@ -60,7 +60,7 @@ QUICK START EXAMPLES:
   JSON output for tools/scripts:
     ck --json --sem "bug fix" src/    # Traditional JSON (single array)
     ck --json --limit 5 "TODO"       # Limit results (--limit alias for --topk)
-    
+
   JSONL output for AI agents (recommended):
     ck --jsonl "auth" --no-snippet    # Streaming, memory-efficient format
     ck --jsonl --sem "error" src/     # Perfect for LLM/agent consumption
@@ -68,7 +68,7 @@ QUICK START EXAMPLES:
     # Why JSONL? Streaming, error-resilient, standard in AI pipelines
 
   Advanced grep features:
-    ck -C 2 "error" src/              # Show 2 lines of context  
+    ck -C 2 "error" src/              # Show 2 lines of context
     ck -A 3 -B 1 "TODO"              # 3 lines after, 1 before
     ck -w "test" .                    # Match whole words only
     ck -F "log.Error()" .             # Fixed string (no regex)
@@ -86,7 +86,7 @@ QUICK START EXAMPLES:
 
   SEARCH MODES:
   --regex   : Classic grep behavior (default, no index needed)
-  --lex     : BM25 lexical search (auto-indexed before it runs)  
+  --lex     : BM25 lexical search (auto-indexed before it runs)
   --sem     : Semantic/embedding search (auto-indexed, defaults: top 10, threshold ≥0.6)
   --hybrid  : Combines regex and semantic (shares the auto-indexing path)
 
@@ -96,7 +96,7 @@ RESULT FILTERING:
                       (0.0-1.0 semantic/lexical, 0.01-0.05 hybrid RRF)
   --scores          : Show scores in output [0.950] file:line:match
 
-The semantic search understands meaning - searching for "error handling" 
+The semantic search understands meaning - searching for "error handling"
 will find try/catch blocks, error returns, exception handling, etc.
 "#)]
 #[command(version)]
@@ -380,6 +380,18 @@ struct Cli {
         ]
     )]
     tui: bool,
+
+    #[arg(
+        long = "rebenchmark",
+        help = "Force re-run hardware acceleration benchmark and update cache"
+    )]
+    rebenchmark: bool,
+
+    #[arg(
+        long = "show-benchmark",
+        help = "Display cached hardware acceleration benchmark results"
+    )]
+    show_benchmark: bool,
 }
 
 fn canonicalize_for_comparison(path: &Path) -> PathBuf {
@@ -888,6 +900,101 @@ async fn run_main() -> Result<()> {
 
     if cli.print_default_ckignore {
         print!("{}", get_default_ckignore_content());
+        return Ok(());
+    }
+
+    // Hardware acceleration benchmark commands
+    #[cfg(feature = "fastembed")]
+    if cli.show_benchmark {
+        let registry = ck_models::ModelRegistry::default();
+        let model_alias = cli.model.as_deref().unwrap_or("bge-small");
+        let (_, config) = registry.resolve(Some(model_alias))?;
+
+        let model = match config.name.as_str() {
+            "BAAI/bge-small-en-v1.5" => fastembed::EmbeddingModel::BGESmallENV15,
+            "sentence-transformers/all-MiniLM-L6-v2" => fastembed::EmbeddingModel::AllMiniLML6V2,
+            "nomic-embed-text-v1" => fastembed::EmbeddingModel::NomicEmbedTextV1,
+            "nomic-embed-text-v1.5" => fastembed::EmbeddingModel::NomicEmbedTextV15,
+            "jina-embeddings-v2-base-code" => fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode,
+            "BAAI/bge-base-en-v1.5" => fastembed::EmbeddingModel::BGEBaseENV15,
+            "BAAI/bge-large-en-v1.5" => fastembed::EmbeddingModel::BGELargeENV15,
+            _ => fastembed::EmbeddingModel::NomicEmbedTextV15,
+        };
+
+        // Ensure cache is up-to-date
+        let _ = ck_embed::accel::select_provider(model, &config.name, false)?;
+
+        if let Some(cache) = ck_embed::accel::BenchmarkCache::load(&config.name) {
+            println!("Hardware Acceleration Benchmark Results");
+            println!("Model: {}\n", cache.model);
+            println!(
+                "{:>12}  {:>12}  {:>12}  {:>12}  {:>8}",
+                "Provider", "Throughput", "Init", "Inference", "200ch"
+            );
+            println!("{}", "-".repeat(62));
+            for r in &cache.results {
+                if r.error.is_none() {
+                    let sel = if r.provider == cache.selected {
+                        " <-"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "{:>12}  {:>10.0}t/s  {:>10.0}ms  {:>10.1}ms  {:>6.1}s{}",
+                        r.provider,
+                        r.tokens_per_sec,
+                        r.init_ms,
+                        r.avg_inf_ms,
+                        r.workload_time_sec,
+                        sel
+                    );
+                } else {
+                    println!(
+                        "{:>12}  {:>10}  {:>10}  {:>10}  {:>6}  ({})",
+                        r.provider,
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        r.error.as_deref().unwrap_or("unknown error")
+                    );
+                }
+            }
+        } else {
+            println!(
+                "No benchmark results cached. Run `ck --rebenchmark` or perform a semantic search to trigger benchmarking."
+            );
+        }
+        return Ok(());
+    }
+
+    #[cfg(feature = "fastembed")]
+    if cli.rebenchmark {
+        let registry = ck_models::ModelRegistry::default();
+        let model_alias = cli.model.as_deref().unwrap_or("bge-small");
+        let (_, config) = registry.resolve(Some(model_alias))?;
+
+        let model = match config.name.as_str() {
+            "BAAI/bge-small-en-v1.5" => fastembed::EmbeddingModel::BGESmallENV15,
+            "sentence-transformers/all-MiniLM-L6-v2" => fastembed::EmbeddingModel::AllMiniLML6V2,
+            "nomic-embed-text-v1" => fastembed::EmbeddingModel::NomicEmbedTextV1,
+            "nomic-embed-text-v1.5" => fastembed::EmbeddingModel::NomicEmbedTextV15,
+            "jina-embeddings-v2-base-code" => fastembed::EmbeddingModel::JinaEmbeddingsV2BaseCode,
+            "BAAI/bge-base-en-v1.5" => fastembed::EmbeddingModel::BGEBaseENV15,
+            "BAAI/bge-large-en-v1.5" => fastembed::EmbeddingModel::BGELargeENV15,
+            _ => fastembed::EmbeddingModel::NomicEmbedTextV15,
+        };
+
+        println!(
+            "Running hardware acceleration benchmark for model: {}",
+            config.name
+        );
+        let providers = ck_embed::accel::select_provider(model, &config.name, true)?;
+        println!(
+            "\nBenchmark complete. {} provider(s) selected.",
+            providers.len()
+        );
+        println!("Run `ck --show-benchmark` to see detailed results.");
         return Ok(());
     }
 

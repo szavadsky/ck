@@ -5,6 +5,8 @@ use std::path::Path;
 #[cfg(any(feature = "fastembed", feature = "mixedbread"))]
 use std::path::PathBuf;
 
+#[cfg(feature = "fastembed")]
+pub mod accel;
 pub mod reranker;
 pub mod tokenizer;
 
@@ -219,10 +221,14 @@ impl FastEmbedder {
             _ => 512, // Safe default
         };
 
+        // Select hardware acceleration provider
+        let providers = accel::select_provider(model.clone(), model_name, false)?;
+
         let init_options = InitOptions::new(model.clone())
             .with_show_download_progress(progress_callback.is_some())
             .with_cache_dir(model_cache_dir)
-            .with_max_length(max_length);
+            .with_max_length(max_length)
+            .with_execution_providers(providers);
 
         let embedding = TextEmbedding::try_new(init_options)?;
 
