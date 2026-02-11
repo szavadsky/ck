@@ -448,6 +448,18 @@ pub fn select_provider(
         providers
     );
 
+    // Pre-download model to avoid counting download time in first provider's init
+    let cache_dir = match crate::model_cache_root() {
+        Ok(d) => d,
+        Err(e) => bail!("cache dir error: {e}"),
+    };
+    let pre_init_opts = InitOptions::new(model.clone())
+        .with_cache_dir(cache_dir)
+        .with_execution_providers(vec![build_provider("cpu")?]);
+    let mut _dummy_embedding = TextEmbedding::try_new(pre_init_opts)?;
+    let _ = _dummy_embedding.embed(vec!["pre-download test".to_string()], None);
+    drop(_dummy_embedding); // Ensure it's dropped before benchmarking
+
     let mut results: Vec<ProviderResult> = Vec::new();
     for name in &providers {
         eprintln!("[accel]   testing {name}...");
