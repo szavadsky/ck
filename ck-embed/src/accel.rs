@@ -5,7 +5,7 @@
 
 use anyhow::{Result, bail};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use ort::execution_providers::ExecutionProviderDispatch;
+use ort::execution_providers::{ExecutionProvider, ExecutionProviderDispatch};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::path::PathBuf;
@@ -16,43 +16,158 @@ use std::time::Instant;
 // The `cpu-only` feature disables every accelerator.
 // ---------------------------------------------------------------------------
 
-/// Returns the list of execution providers that are available on this system.
+/// Check whether an execution provider is usable on this system.
+///
+/// The ORT C-level `GetAvailableProviders` only reports *statically* linked
+/// providers.  Providers loaded via external shared libraries (e.g. the
+/// OpenVINO EP shipped as `libonnxruntime_providers_openvino.so`) are **not**
+/// reported, so `ExecutionProvider::is_available()` returns `false` for them.
+///
+/// We therefore combine two checks:
+///   1. `is_available()` — catches statically-linked providers (CUDA, ROCm …).
+///   2. File-based probe — looks for the provider `.so` / `.dll` next to the
+///      ORT runtime library we discovered earlier.
+fn is_provider_available(name: &str) -> bool {
+    // First try the authoritative C-API check (works for static providers).
+    let api_available = match name {
+        #[cfg(all(not(feature = "cpu-only"), any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "aarch64"),
+            all(target_os = "windows", target_arch = "x86_64"),
+        )))]
+        "cuda" => {
+            use ort::execution_providers::CUDAExecutionProvider;
+            CUDAExecutionProvider::default().is_available().unwrap_or(false)
+        }
+
+        #[cfg(all(not(feature = "cpu-only"), any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "windows", target_arch = "x86_64"),
+        )))]
+        "tensorrt" => {
+            use ort::execution_providers::TensorRTExecutionProvider;
+            TensorRTExecutionProvider::default().is_available().unwrap_or(false)
+        }
+
+        #[cfg(all(not(feature = "cpu-only"), any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "windows", target_arch = "x86_64"),
+        )))]
+        "openvino" => {
+            use ort::execution_providers::OpenVINOExecutionProvider;
+            OpenVINOExecutionProvider::default().is_available().unwrap_or(false)
+        }
+
+        #[cfg(all(not(feature = "cpu-only"), all(target_os = "linux", target_arch = "x86_64")))]
+        "rocm" => {
+            use ort::execution_providers::ROCmExecutionProvider;
+            ROCmExecutionProvider::default().is_available().unwrap_or(false)
+        }
+
+        #[cfg(all(not(feature = "cpu-only"), all(target_os = "windows", target_arch = "x86_64")))]
+        "directml" => {
+            use ort::execution_providers::DirectMLExecutionProvider;
+            DirectMLExecutionProvider::default().is_available().unwrap_or(false)
+        }
+
+        #[cfg(all(not(feature = "cpu-only"), all(target_os = "macos", target_arch = "aarch64")))]
+        "coreml" => {
+            use ort::execution_providers::CoreMLExecutionProvider;
+            CoreMLExecutionProvider::default().is_available().unwrap_or(false)
+        }
+
+        "cpu" => return true,
+        _ => return false,
+    };
+
+    if api_available {
+        return true;
+    }
+
+    // Fall back to file-based detection: look for the provider shared library
+    // next to the ORT dylib we are loading.
+    has_provider_shared_lib(name)
+}
+
+/// Map a provider name to the expected shared library file that ORT loads at
+/// session-creation time.
+fn provider_lib_name(name: &str) -> Option<&'static str> {
+    match name {
+        "openvino" => Some("libonnxruntime_providers_openvino.so"),
+        "cuda"     => Some("libonnxruntime_providers_cuda.so"),
+        "tensorrt" => Some("libonnxruntime_providers_tensorrt.so"),
+        "rocm"     => Some("libonnxruntime_providers_rocm.so"),
+        _ => None,
+    }
+}
+
+/// Check whether the provider shared library exists in one of the discovered
+/// ORT runtime directories.
+fn has_provider_shared_lib(name: &str) -> bool {
+    let lib_name = match provider_lib_name(name) {
+        Some(n) => n,
+        None => return false,
+    };
+
+    // Check env-override first
+    if let Ok(dir) = std::env::var("CK_ORT_LIB_DIR") {
+        if PathBuf::from(&dir).join(lib_name).is_file() {
+            return true;
+        }
+    }
+
+    // Check all known runtime directories
+    let mut dirs = ck_native_runtime_candidates();
+    dirs.extend(system_runtime_candidates());
+    for dir in dirs {
+        if dir.join(lib_name).is_file() {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Returns the list of execution providers that are actually available in the
+/// loaded ONNX Runtime library on this system.
 pub fn available_providers() -> Result<Vec<String>> {
+    // Always ensure the native ORT runtime is discoverable before we query it.
+    ensure_ort_runtime_paths();
+
     let mut providers = vec!["cpu".to_string()];
 
     #[cfg(not(feature = "cpu-only"))]
     {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        {
-            let candidates = ["cuda", "tensorrt", "openvino", "rocm"];
-            for name in candidates {
-                if build_provider(name).is_ok() {
-                    providers.push(name.to_string());
-                }
-            }
-        }
+        let candidates = ["cuda", "tensorrt", "openvino", "rocm"];
 
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
-        {
-            if build_provider("cuda").is_ok() {
-                providers.push("cuda".to_string());
-            }
-        }
+        let candidates = ["cuda"];
 
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-        {
-            let candidates = ["cuda", "tensorrt", "openvino", "directml"];
-            for name in candidates {
-                if build_provider(name).is_ok() {
-                    providers.push(name.to_string());
-                }
-            }
-        }
+        let candidates = ["cuda", "tensorrt", "openvino", "directml"];
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            if build_provider("coreml").is_ok() {
-                providers.push("coreml".to_string());
+        let candidates = ["coreml"];
+
+        #[cfg(not(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "linux", target_arch = "aarch64"),
+            all(target_os = "windows", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64"),
+        )))]
+        let candidates: [&str; 0] = [];
+
+        for name in candidates {
+            if is_provider_available(name) {
+                // OpenVINO supports multiple device targets; benchmark each one
+                // that might be present so the winner is chosen automatically.
+                if name == "openvino" {
+                    providers.push("openvino-cpu".to_string());
+                    providers.push("openvino-gpu".to_string());
+                } else {
+                    providers.push(name.to_string());
+                }
             }
         }
     }
@@ -411,7 +526,7 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "cuda" => {
             use ort::execution_providers::CUDAExecutionProvider;
-            Ok(CUDAExecutionProvider::default().build().error_on_failure())
+            Ok(CUDAExecutionProvider::default().build())
         }
 
         #[cfg(all(
@@ -423,7 +538,7 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "tensorrt" => {
             use ort::execution_providers::TensorRTExecutionProvider;
-            Ok(TensorRTExecutionProvider::default().build().error_on_failure())
+            Ok(TensorRTExecutionProvider::default().build())
         }
 
         #[cfg(all(
@@ -433,24 +548,29 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
                 all(target_os = "windows", target_arch = "x86_64"),
             )
         ))]
-        "openvino" => {
+        // Accept both "openvino" (legacy / forced) and the device-specific
+        // variants "openvino-cpu" / "openvino-gpu" that the benchmarker emits.
+        "openvino" | "openvino-cpu" => {
             use ort::execution_providers::OpenVINOExecutionProvider;
             let device = std::env::var("CK_OPENVINO_DEVICE")
-                .unwrap_or_else(|_| "GPU".to_string());
-            let opencl_throttling = std::env::var("CK_OPENVINO_OPENCL_THROTTLING")
-                .ok()
-                .and_then(|v| match v.to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" => Some(true),
-                    "0" | "false" | "no" | "off" => Some(false),
-                    _ => None,
-                })
-                .unwrap_or(true);
-
+                .unwrap_or_else(|_| "CPU".to_string());
             Ok(OpenVINOExecutionProvider::default()
                 .with_device_type(device)
-                .with_opencl_throttling(opencl_throttling)
-                .build()
-                .error_on_failure())
+                .build())
+        }
+
+        #[cfg(all(
+            not(feature = "cpu-only"),
+            any(
+                all(target_os = "linux", target_arch = "x86_64"),
+                all(target_os = "windows", target_arch = "x86_64"),
+            )
+        ))]
+        "openvino-gpu" => {
+            use ort::execution_providers::OpenVINOExecutionProvider;
+            Ok(OpenVINOExecutionProvider::default()
+                .with_device_type("GPU")
+                .build())
         }
 
         #[cfg(all(
@@ -459,7 +579,7 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "rocm" => {
             use ort::execution_providers::ROCmExecutionProvider;
-            Ok(ROCmExecutionProvider::default().build().error_on_failure())
+            Ok(ROCmExecutionProvider::default().build())
         }
 
         #[cfg(all(
@@ -468,7 +588,7 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "directml" => {
             use ort::execution_providers::DirectMLExecutionProvider;
-            Ok(DirectMLExecutionProvider::default().build().error_on_failure())
+            Ok(DirectMLExecutionProvider::default().build())
         }
 
         #[cfg(all(
@@ -477,12 +597,12 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "coreml" => {
             use ort::execution_providers::CoreMLExecutionProvider;
-            Ok(CoreMLExecutionProvider::default().build().error_on_failure())
+            Ok(CoreMLExecutionProvider::default().build())
         }
 
         "cpu" => {
             use ort::execution_providers::CPUExecutionProvider;
-            Ok(CPUExecutionProvider::default().build().error_on_failure())
+            Ok(CPUExecutionProvider::default().build())
         }
 
         other => bail!("unknown execution provider: {other}"),
@@ -602,8 +722,6 @@ pub fn select_provider(
     model_name: &str,
     force_rebenchmark: bool,
 ) -> Result<Vec<ExecutionProviderDispatch>> {
-    ensure_ort_runtime_paths();
-
     // 1. Check env-var override
     if let Ok(forced) = std::env::var("CK_FORCE_PROVIDER") {
         eprintln!("[accel] CK_FORCE_PROVIDER={forced} – using forced provider");
