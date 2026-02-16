@@ -361,6 +361,15 @@ sudo apt install rocm-smi rocm-opencl-runtime
 sudo apt install openvino
 ```
 
+OpenVINO acceleration also requires ONNX Runtime provider shared libraries at runtime.
+If benchmark output includes `libonnxruntime_providers_shared.so` load errors, install an OpenVINO-enabled ONNX Runtime runtime and set `ORT_DYLIB_PATH` to your `libonnxruntime.so`.
+ck also auto-detects native runtime locations such as `~/.cache/ck/onnxruntime/*/lib`, `/usr/lib`, and `/opt/openvino/runtime/lib/intel64`; you can explicitly set `CK_ORT_LIB_DIR` to the ONNX Runtime `lib` directory when needed.
+
+To install native OpenVINO runtime libs for ck:
+```bash
+./scripts/install-native-openvino-runtime.sh
+```
+
 ### macOS
 
 No extra dependencies needed. CoreML acceleration is built into macOS and used automatically on Apple Silicon.
@@ -381,6 +390,12 @@ ck --show-benchmark
 
 # Force CPU-only (useful for debugging)
 CK_FORCE_PROVIDER=cpu ck --sem "query" src/
+
+# Force OpenVINO on Intel GPU (OpenCL-backed)
+CK_FORCE_PROVIDER=openvino CK_OPENVINO_DEVICE=GPU ck --sem "query" src/
+
+# Optional selection strategy override
+CK_PROVIDER_SELECTION=workload ck --rebenchmark
 ```
 
 ::: tip

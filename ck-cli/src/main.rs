@@ -900,7 +900,43 @@ async fn main() {
     }
 }
 
+#[cfg(feature = "fastembed")]
+fn maybe_reexec_with_native_ort_runtime() -> Result<()> {
+    if std::env::var("CK_ORT_BOOTSTRAPPED").is_ok() {
+        return Ok(());
+    }
+
+    if std::env::var("ORT_DYLIB_PATH").is_ok() {
+        return Ok(());
+    }
+
+    let Some((ort_dylib_path, ort_lib_dir)) = ck_embed::accel::discovered_runtime_env() else {
+        return Ok(());
+    };
+
+    let exe = std::env::current_exe()?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args)
+        .env("CK_ORT_BOOTSTRAPPED", "1")
+        .env("ORT_DYLIB_PATH", ort_dylib_path);
+
+    if cfg!(target_os = "linux") {
+        let merged = match std::env::var("LD_LIBRARY_PATH") {
+            Ok(existing) if !existing.is_empty() => format!("{}:{}", ort_lib_dir, existing),
+            _ => ort_lib_dir,
+        };
+        cmd.env("LD_LIBRARY_PATH", merged);
+    }
+
+    let status = cmd.status()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 async fn run_main() -> Result<()> {
+    #[cfg(feature = "fastembed")]
+    maybe_reexec_with_native_ort_runtime()?;
+
     let cli = Cli::parse();
 
     if cli.print_default_ckignore {

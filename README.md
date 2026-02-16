@@ -431,6 +431,15 @@ sudo apt install rocm-smi rocm-opencl-runtime
 sudo apt install openvino
 ```
 
+OpenVINO execution provider also requires ONNX Runtime provider shared libraries at runtime.
+If you see `Failed to load library libonnxruntime_providers_shared.so`, install an OpenVINO-enabled ONNX Runtime build and point `ORT_DYLIB_PATH` to `libonnxruntime.so`.
+ck auto-detects native runtime locations such as `~/.cache/ck/onnxruntime/*/lib`, `/usr/lib`, and `/opt/openvino/runtime/lib/intel64`; you can override detection with `CK_ORT_LIB_DIR=/path/to/onnxruntime/lib`.
+
+Install native OpenVINO runtime libs for ck with:
+```bash
+./scripts/install-native-openvino-runtime.sh
+```
+
 **macOS:**
 No extra dependencies — CoreML is built into macOS.
 
@@ -450,6 +459,18 @@ ck --show-benchmark
 # Force a specific provider (skip benchmarking)
 CK_FORCE_PROVIDER=cuda ck --sem "query" src/
 
+# Force OpenVINO GPU path (Intel OpenCL-backed)
+CK_FORCE_PROVIDER=openvino CK_OPENVINO_DEVICE=GPU ck --sem "query" src/
+
+# Optional OpenVINO tuning
+# CK_OPENVINO_OPENCL_THROTTLING=true|false  (default: true)
+
+# Provider selection strategy
+# CK_PROVIDER_SELECTION=inference|workload  (default: inference)
+
+# Explicit ORT runtime directory override (contains libonnxruntime*.so + providers)
+# CK_ORT_LIB_DIR=/path/to/onnxruntime/lib
+
 # Build with CPU-only (disable all accelerators)
 cargo install ck-search --features cpu-only
 ```
@@ -458,7 +479,7 @@ cargo install ck-search --features cpu-only
 
 1. On first semantic search, ck tests all compiled execution providers
 2. Each provider runs 5 warmup + 20 measurement iterations
-3. The fastest provider (lowest total workload time) is selected
+3. The fastest provider (lowest average inference latency by default) is selected
 4. Results are cached in `~/.cache/ck/benchmarks/` for 30 days
 5. Cache auto-invalidates when GPU hardware or drivers change
 

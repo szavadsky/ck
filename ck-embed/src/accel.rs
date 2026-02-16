@@ -7,6 +7,7 @@ use anyhow::{Result, bail};
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use ort::execution_providers::ExecutionProviderDispatch;
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -102,12 +103,16 @@ pub struct ProviderResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BenchmarkCache {
+    #[serde(default)]
+    pub version: u32,
     pub model: String,
     pub timestamp: u64,
     pub system_hash: String,
     pub results: Vec<ProviderResult>,
     pub selected: String,
 }
+
+const BENCHMARK_CACHE_VERSION: u32 = 2;
 
 impl BenchmarkCache {
     fn cache_path(model_name: &str) -> PathBuf {
@@ -123,6 +128,11 @@ impl BenchmarkCache {
         let path = Self::cache_path(model_name);
         let data = std::fs::read_to_string(&path).ok()?;
         let cache: Self = serde_json::from_str(&data).ok()?;
+
+        if cache.version != BENCHMARK_CACHE_VERSION {
+            eprintln!("[accel] benchmark cache version changed – re-benchmarking");
+            return None;
+        }
 
         // Invalidate if system changed
         let current_hash = system_hash();
@@ -215,6 +225,175 @@ fn system_hash() -> String {
     format!("{:x}", md5::compute(fingerprint.as_bytes()))
 }
 
+fn has_file(dir: &std::path::Path, name: &str) -> bool {
+    dir.join(name).is_file()
+}
+
+fn find_runtime_so(dir: &std::path::Path) -> Option<PathBuf> {
+    let canonical = dir.join("libonnxruntime.so");
+    if canonical.is_file() {
+        return Some(canonical);
+    }
+
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("libonnxruntime.so."))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    candidates.sort();
+    candidates.pop()
+}
+
+fn split_paths(var_name: &str) -> Vec<PathBuf> {
+    std::env::var_os(var_name)
+        .map(|v| std::env::split_paths(&v).collect())
+        .unwrap_or_default()
+}
+
+fn ck_native_runtime_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(home) = dirs::home_dir() {
+        let root = home.join(".cache").join("ck").join("onnxruntime");
+        candidates.push(root.join("native-openvino").join("lib"));
+        candidates.push(root.join("openvino").join("lib"));
+
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    candidates.push(path.join("lib"));
+                }
+            }
+        }
+    }
+
+    candidates
+}
+
+fn system_runtime_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/usr/lib"),
+        PathBuf::from("/usr/lib64"),
+        PathBuf::from("/usr/local/lib"),
+        PathBuf::from("/lib"),
+        PathBuf::from("/lib64"),
+        PathBuf::from("/opt/onnxruntime/lib"),
+        PathBuf::from("/opt/intel/onnxruntime/lib"),
+        PathBuf::from("/opt/openvino/runtime/lib/intel64"),
+    ];
+
+    candidates.extend(split_paths("LD_LIBRARY_PATH"));
+    candidates
+}
+
+fn discover_ort_runtime_dir(require_openvino_provider: bool) -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CK_ORT_LIB_DIR") {
+        let path = PathBuf::from(dir);
+        if has_file(&path, "libonnxruntime_providers_shared.so")
+            && (!require_openvino_provider
+                || has_file(&path, "libonnxruntime_providers_openvino.so"))
+            && find_runtime_so(&path).is_some()
+        {
+            return Some(path);
+        }
+    }
+
+    let mut candidates = ck_native_runtime_candidates();
+    candidates.extend(system_runtime_candidates());
+
+    for dir in candidates {
+        if has_file(&dir, "libonnxruntime_providers_shared.so")
+            && (!require_openvino_provider
+                || has_file(&dir, "libonnxruntime_providers_openvino.so"))
+            && find_runtime_so(&dir).is_some()
+        {
+            return Some(dir);
+        }
+    }
+
+    None
+}
+
+pub fn discovered_runtime_env() -> Option<(String, String)> {
+    let dir = discover_ort_runtime_dir(true)?;
+    let runtime_so = find_runtime_so(&dir)?;
+    Some((
+        runtime_so.to_string_lossy().to_string(),
+        dir.to_string_lossy().to_string(),
+    ))
+}
+
+fn ensure_ort_runtime_paths() {
+    if std::env::var("ORT_DYLIB_PATH").is_ok() {
+        return;
+    }
+
+    let Some(dir) = discover_ort_runtime_dir(true) else {
+        return;
+    };
+    let Some(runtime_so) = find_runtime_so(&dir) else {
+        return;
+    };
+
+    let runtime_so_str = runtime_so.to_string_lossy().to_string();
+    let dir_str = dir.to_string_lossy().to_string();
+
+    unsafe {
+        std::env::set_var("ORT_DYLIB_PATH", runtime_so_str);
+    }
+
+    if cfg!(target_os = "linux") {
+        let merged = match std::env::var("LD_LIBRARY_PATH") {
+            Ok(existing) if !existing.is_empty() => format!("{}:{}", dir_str, existing),
+            _ => dir_str,
+        };
+        unsafe {
+            std::env::set_var("LD_LIBRARY_PATH", merged);
+        }
+    }
+}
+
+fn normalize_provider_error(provider: &str, err: &str) -> String {
+    if err.contains("execution provider is not enabled in this build") {
+        return format!(
+            "{} execution provider is not available in the active ONNX Runtime library bundle",
+            provider.to_uppercase()
+        );
+    }
+
+    if err.contains("Failed to load shared library") {
+        return format!(
+            "{} provider shared library missing or not loadable (set CK_ORT_LIB_DIR to a valid ONNX Runtime lib directory)",
+            provider
+        );
+    }
+
+    err.to_string()
+}
+
+#[derive(Copy, Clone)]
+enum WinnerMetric {
+    Inference,
+    Workload,
+}
+
+fn winner_metric() -> WinnerMetric {
+    match std::env::var("CK_PROVIDER_SELECTION") {
+        Ok(v) if v.eq_ignore_ascii_case("workload") || v.eq_ignore_ascii_case("total") => {
+            WinnerMetric::Workload
+        }
+        _ => WinnerMetric::Inference,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Provider construction
 // ---------------------------------------------------------------------------
@@ -232,7 +411,7 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "cuda" => {
             use ort::execution_providers::CUDAExecutionProvider;
-            Ok(CUDAExecutionProvider::default().build())
+            Ok(CUDAExecutionProvider::default().build().error_on_failure())
         }
 
         #[cfg(all(
@@ -244,7 +423,7 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "tensorrt" => {
             use ort::execution_providers::TensorRTExecutionProvider;
-            Ok(TensorRTExecutionProvider::default().build())
+            Ok(TensorRTExecutionProvider::default().build().error_on_failure())
         }
 
         #[cfg(all(
@@ -256,7 +435,22 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "openvino" => {
             use ort::execution_providers::OpenVINOExecutionProvider;
-            Ok(OpenVINOExecutionProvider::default().build())
+            let device = std::env::var("CK_OPENVINO_DEVICE")
+                .unwrap_or_else(|_| "GPU".to_string());
+            let opencl_throttling = std::env::var("CK_OPENVINO_OPENCL_THROTTLING")
+                .ok()
+                .and_then(|v| match v.to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => Some(true),
+                    "0" | "false" | "no" | "off" => Some(false),
+                    _ => None,
+                })
+                .unwrap_or(true);
+
+            Ok(OpenVINOExecutionProvider::default()
+                .with_device_type(device)
+                .with_opencl_throttling(opencl_throttling)
+                .build()
+                .error_on_failure())
         }
 
         #[cfg(all(
@@ -265,7 +459,7 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "rocm" => {
             use ort::execution_providers::ROCmExecutionProvider;
-            Ok(ROCmExecutionProvider::default().build())
+            Ok(ROCmExecutionProvider::default().build().error_on_failure())
         }
 
         #[cfg(all(
@@ -274,7 +468,7 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "directml" => {
             use ort::execution_providers::DirectMLExecutionProvider;
-            Ok(DirectMLExecutionProvider::default().build())
+            Ok(DirectMLExecutionProvider::default().build().error_on_failure())
         }
 
         #[cfg(all(
@@ -283,12 +477,12 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
         ))]
         "coreml" => {
             use ort::execution_providers::CoreMLExecutionProvider;
-            Ok(CoreMLExecutionProvider::default().build())
+            Ok(CoreMLExecutionProvider::default().build().error_on_failure())
         }
 
         "cpu" => {
             use ort::execution_providers::CPUExecutionProvider;
-            Ok(CPUExecutionProvider::default().build())
+            Ok(CPUExecutionProvider::default().build().error_on_failure())
         }
 
         other => bail!("unknown execution provider: {other}"),
@@ -408,6 +602,8 @@ pub fn select_provider(
     model_name: &str,
     force_rebenchmark: bool,
 ) -> Result<Vec<ExecutionProviderDispatch>> {
+    ensure_ort_runtime_paths();
+
     // 1. Check env-var override
     if let Ok(forced) = std::env::var("CK_FORCE_PROVIDER") {
         eprintln!("[accel] CK_FORCE_PROVIDER={forced} – using forced provider");
@@ -473,12 +669,15 @@ pub fn select_provider(
                     avg_inf_ms: 0.0,
                     tokens_per_sec: 0.0,
                     workload_time_sec: 0.0,
-                    error: Some(format!("{e}")),
+                    error: Some(normalize_provider_error(name, &format!("{e}"))),
                 });
                 continue;
             }
         };
-        let result = benchmark_one(provider, name, model.clone());
+        let mut result = benchmark_one(provider, name, model.clone());
+        if let Some(err) = result.error.take() {
+            result.error = Some(normalize_provider_error(name, &err));
+        }
         if let Some(ref err) = result.error {
             eprintln!("[accel]   {name}: error – {err}");
         } else {
@@ -490,19 +689,39 @@ pub fn select_provider(
         results.push(result);
     }
 
-    // 4. Pick the winner – lowest workload_time_sec among successes
+    // 4. Pick winner
+    let metric = winner_metric();
     let winner = results
         .iter()
         .filter(|r| r.error.is_none())
-        .min_by(|a, b| {
-            a.workload_time_sec
+        .min_by(|a, b| match metric {
+            WinnerMetric::Inference => a
+                .avg_inf_ms
+                .partial_cmp(&b.avg_inf_ms)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    a.workload_time_sec
+                        .partial_cmp(&b.workload_time_sec)
+                        .unwrap_or(Ordering::Equal)
+                }),
+            WinnerMetric::Workload => a
+                .workload_time_sec
                 .partial_cmp(&b.workload_time_sec)
-                .unwrap()
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    a.avg_inf_ms
+                        .partial_cmp(&b.avg_inf_ms)
+                        .unwrap_or(Ordering::Equal)
+                }),
         })
         .map(|r| r.provider.clone())
         .unwrap_or_else(|| "cpu".to_string());
 
-    eprintln!("[accel] selected provider: {winner}");
+    let metric_name = match metric {
+        WinnerMetric::Inference => "inference",
+        WinnerMetric::Workload => "workload",
+    };
+    eprintln!("[accel] selected provider: {winner} (metric: {metric_name})");
 
     // 5. Save cache
     let now = std::time::SystemTime::now()
@@ -511,6 +730,7 @@ pub fn select_provider(
         .as_secs();
 
     let cache = BenchmarkCache {
+        version: BENCHMARK_CACHE_VERSION,
         model: model_name.to_string(),
         timestamp: now,
         system_hash: system_hash(),

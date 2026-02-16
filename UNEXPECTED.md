@@ -41,6 +41,15 @@ This file tracks instances where ck behaves unexpectedly during testing or usage
 
 ---
 
+**Command:** `ck --rebenchmark --model bge-small`
+**Expected:** If OpenVINO/CUDA/TensorRT/ROCm provider support is missing at build/runtime, benchmark should clearly report that provider is unavailable.
+**Actual:** Previously, providers could appear benchmarked/selected even when registration failed internally and execution silently fell back to CPU.
+**Date:** 2026-02-15
+**Status:** Fixed
+**Notes:** Fixed by forcing execution-provider registration errors (`error_on_failure`) so unsupported providers no longer silently fall back during benchmarking/selection.
+
+---
+
 ## Instructions
 
 When you encounter unexpected behavior while using ck:
