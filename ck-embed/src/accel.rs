@@ -204,9 +204,9 @@ const BENCH_SAMPLES: &[&str] = &[
     "data Tree a = Leaf a | Branch (Tree a) (Tree a) deriving (Show, Eq)",
 ];
 
-const DEFAULT_BENCH_WORKLOAD_CHUNKS_INDEXING: usize = 240;
+const DEFAULT_BENCH_WORKLOAD_CHUNKS_INDEXING: usize = 64;
 const DEFAULT_BENCH_BATCH_SIZE_INDEXING: usize = 64;
-const DEFAULT_BENCH_WORKLOAD_CHUNKS_SEARCH: usize = 32;
+const DEFAULT_BENCH_WORKLOAD_CHUNKS_SEARCH: usize = 12;
 const DEFAULT_BENCH_BATCH_SIZE_SEARCH: usize = 1;
 
 // ---------------------------------------------------------------------------
@@ -234,9 +234,11 @@ pub struct BenchmarkCache {
     pub system_hash: String,
     pub results: Vec<ProviderResult>,
     pub selected: String,
+    #[serde(default)]
+    pub software_fingerprint: String,
 }
 
-const BENCHMARK_CACHE_VERSION: u32 = 3;
+const BENCHMARK_CACHE_VERSION: u32 = 4;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ProviderProfile {
@@ -290,13 +292,10 @@ impl BenchmarkCache {
             return None;
         }
 
-        // Invalidate if older than 30 days
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        if now.saturating_sub(cache.timestamp) > 30 * 24 * 3600 {
-            eprintln!("[accel] cache expired (>30 days) – re-benchmarking");
+        // Invalidate when software/runtime stack changes.
+        let current_software = software_fingerprint();
+        if cache.software_fingerprint != current_software {
+            eprintln!("[accel] software/runtime changed – re-benchmarking");
             return None;
         }
 
@@ -371,6 +370,18 @@ fn get_driver_versions() -> String {
 
 fn system_hash() -> String {
     let fingerprint = format!("{}\n{}", get_gpu_list(), get_driver_versions());
+    format!("{:x}", md5::compute(fingerprint.as_bytes()))
+}
+
+fn software_fingerprint() -> String {
+    let runtime_path = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
+    let runtime_dir = std::env::var("CK_ORT_LIB_DIR").unwrap_or_default();
+    let fingerprint = format!(
+        "ck={}\nort_dylib={}\nort_dir={}",
+        env!("CARGO_PKG_VERSION"),
+        runtime_path,
+        runtime_dir
+    );
     format!("{:x}", md5::compute(fingerprint.as_bytes()))
 }
 
@@ -746,17 +757,17 @@ pub fn benchmark_one(
     let samples = build_workload_samples(profile);
     let batch_size = benchmark_batch_size(profile);
 
-    // 2 warmup iterations
-    for _ in 0..2 {
+    // 1 warmup iteration
+    for _ in 0..1 {
         let _ = run_embed_workload(&mut embedding, &samples, batch_size);
     }
 
-    // Measurement iterations: run at least 2 iterations, up to 0.5 seconds total
-    let max_measure_time = 0.5; // seconds
+    // Measurement iterations: at least 1 iteration, up to 0.25 seconds total
+    let max_measure_time = 0.25; // seconds
     let mut measure_times = Vec::new();
     let mut total_measure = 0.0;
     let mut iterations = 0;
-    while iterations < 2 || (iterations < 50 && total_measure < max_measure_time) {
+    while iterations < 1 || (iterations < 12 && total_measure < max_measure_time) {
         let iter_start = Instant::now();
         if let Err(e) = run_embed_workload(&mut embedding, &samples, batch_size) {
             return ProviderResult {
@@ -1005,6 +1016,7 @@ pub fn select_provider_with_profile(
         system_hash: system_hash(),
         results,
         selected: winner.clone(),
+        software_fingerprint: software_fingerprint(),
     };
     if let Err(e) = cache.save(profile) {
         eprintln!("[accel] warning: failed to save cache: {e}");

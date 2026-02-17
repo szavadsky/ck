@@ -121,10 +121,25 @@ pub struct RerankBenchmarkCache {
     pub system_hash: String,
     pub results: Vec<RerankProviderResult>,
     pub selected: String,
+    #[serde(default)]
+    pub software_fingerprint: String,
 }
 
 #[cfg(feature = "fastembed")]
-const RERANK_BENCHMARK_CACHE_VERSION: u32 = 1;
+const RERANK_BENCHMARK_CACHE_VERSION: u32 = 2;
+
+#[cfg(feature = "fastembed")]
+fn rerank_software_fingerprint() -> String {
+    let runtime_path = std::env::var("ORT_DYLIB_PATH").unwrap_or_default();
+    let runtime_dir = std::env::var("CK_ORT_LIB_DIR").unwrap_or_default();
+    let fingerprint = format!(
+        "ck={}\nort_dylib={}\nort_dir={}",
+        env!("CARGO_PKG_VERSION"),
+        runtime_path,
+        runtime_dir
+    );
+    format!("{:x}", md5::compute(fingerprint.as_bytes()))
+}
 
 #[cfg(feature = "fastembed")]
 impl RerankBenchmarkCache {
@@ -155,11 +170,7 @@ impl RerankBenchmarkCache {
             return None;
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_secs();
-        if now.saturating_sub(cache.timestamp) > 30 * 24 * 3600 {
+        if cache.software_fingerprint != rerank_software_fingerprint() {
             return None;
         }
 
@@ -387,6 +398,7 @@ fn select_rerank_provider(
         system_hash,
         results,
         selected: winner.clone(),
+        software_fingerprint: rerank_software_fingerprint(),
     };
     let _ = cache.save();
 
