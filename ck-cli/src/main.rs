@@ -392,6 +392,18 @@ struct Cli {
         help = "Display cached hardware acceleration benchmark results"
     )]
     show_benchmark: bool,
+
+    #[arg(
+        long = "rebenchmark-rerank",
+        help = "Force re-run reranker hardware acceleration benchmark and update cache"
+    )]
+    rebenchmark_rerank: bool,
+
+    #[arg(
+        long = "show-rerank-benchmark",
+        help = "Display cached reranker hardware acceleration benchmark results"
+    )]
+    show_rerank_benchmark: bool,
 }
 
 fn canonicalize_for_comparison(path: &Path) -> PathBuf {
@@ -939,6 +951,62 @@ async fn run_main() -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "fastembed")]
+    if cli.show_rerank_benchmark {
+        let registry = ck_models::RerankModelRegistry::default();
+        let (_, config) = registry.resolve(cli.rerank_model.as_deref())?;
+
+        ck_embed::reranker::rebenchmark_reranker_provider(&config.name, false)?;
+
+        if let Some(cache) = ck_embed::reranker::RerankBenchmarkCache::load(&config.name) {
+            println!("Reranker Hardware Acceleration Benchmark Results");
+            println!("Model: {}\n", cache.model);
+            println!(
+                "{:>12}  {:>12}  {:>12}  {:>12}  {:>8}",
+                "Provider", "Pairs/sec", "Init", "Inference", "Workload"
+            );
+            println!("{}", "-".repeat(64));
+            for r in &cache.results {
+                if r.error.is_none() {
+                    let sel = if r.provider == cache.selected { " <-" } else { "" };
+                    println!(
+                        "{:>12}  {:>10.0}/s  {:>10.0}ms  {:>10.1}ms  {:>6.1}s{}",
+                        r.provider, r.pairs_per_sec, r.init_ms, r.avg_inf_ms, r.workload_time_sec, sel
+                    );
+                } else {
+                    println!(
+                        "{:>12}  {:>10}  {:>10}  {:>10}  {:>6}  ({})",
+                        r.provider,
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        r.error.as_deref().unwrap_or("unknown error")
+                    );
+                }
+            }
+        } else {
+            println!(
+                "No reranker benchmark results cached. Run `ck --rebenchmark-rerank` or use `--rerank` in semantic search."
+            );
+        }
+        return Ok(());
+    }
+
+    #[cfg(feature = "fastembed")]
+    if cli.rebenchmark_rerank {
+        let registry = ck_models::RerankModelRegistry::default();
+        let (_, config) = registry.resolve(cli.rerank_model.as_deref())?;
+        println!(
+            "Running reranker hardware acceleration benchmark for model: {}",
+            config.name
+        );
+        ck_embed::reranker::rebenchmark_reranker_provider(&config.name, true)?;
+        println!("\nReranker benchmark complete.");
+        println!("Run `ck --show-rerank-benchmark` to see detailed results.");
+        return Ok(());
+    }
+
     // Hardware acceleration benchmark commands
     #[cfg(feature = "fastembed")]
     if cli.show_benchmark {
@@ -957,49 +1025,60 @@ async fn run_main() -> Result<()> {
             _ => fastembed::EmbeddingModel::NomicEmbedTextV15,
         };
 
-        // Ensure cache is up-to-date
-        let _ = ck_embed::accel::select_provider(model, &config.name, false)?;
+        let _ = ck_embed::accel::select_provider_with_profile(
+            model.clone(),
+            &config.name,
+            false,
+            ck_embed::accel::ProviderProfile::Search,
+        )?;
+        let _ = ck_embed::accel::select_provider_with_profile(
+            model,
+            &config.name,
+            false,
+            ck_embed::accel::ProviderProfile::Indexing,
+        )?;
 
-        if let Some(cache) = ck_embed::accel::BenchmarkCache::load(&config.name) {
-            println!("Hardware Acceleration Benchmark Results");
-            println!("Model: {}\n", cache.model);
-            println!(
-                "{:>12}  {:>12}  {:>12}  {:>12}  {:>8}",
-                "Provider", "Throughput", "Init", "Inference", "200ch"
-            );
-            println!("{}", "-".repeat(62));
-            for r in &cache.results {
-                if r.error.is_none() {
-                    let sel = if r.provider == cache.selected {
-                        " <-"
+        for profile in [
+            ck_embed::accel::ProviderProfile::Search,
+            ck_embed::accel::ProviderProfile::Indexing,
+        ] {
+            if let Some(cache) = ck_embed::accel::BenchmarkCache::load(&config.name, profile) {
+                println!("Hardware Acceleration Benchmark Results [{}]", match profile {
+                    ck_embed::accel::ProviderProfile::Search => "search",
+                    ck_embed::accel::ProviderProfile::Indexing => "indexing",
+                });
+                println!("Model: {}\n", cache.model);
+                println!(
+                    "{:>12}  {:>12}  {:>12}  {:>12}  {:>8}",
+                    "Provider", "Throughput", "Init", "Inference", "Workload"
+                );
+                println!("{}", "-".repeat(64));
+                for r in &cache.results {
+                    if r.error.is_none() {
+                        let sel = if r.provider == cache.selected { " <-" } else { "" };
+                        println!(
+                            "{:>12}  {:>10.0}t/s  {:>10.0}ms  {:>10.1}ms  {:>6.1}s{}",
+                            r.provider,
+                            r.tokens_per_sec,
+                            r.init_ms,
+                            r.avg_inf_ms,
+                            r.workload_time_sec,
+                            sel
+                        );
                     } else {
-                        ""
-                    };
-                    println!(
-                        "{:>12}  {:>10.0}t/s  {:>10.0}ms  {:>10.1}ms  {:>6.1}s{}",
-                        r.provider,
-                        r.tokens_per_sec,
-                        r.init_ms,
-                        r.avg_inf_ms,
-                        r.workload_time_sec,
-                        sel
-                    );
-                } else {
-                    println!(
-                        "{:>12}  {:>10}  {:>10}  {:>10}  {:>6}  ({})",
-                        r.provider,
-                        "-",
-                        "-",
-                        "-",
-                        "-",
-                        r.error.as_deref().unwrap_or("unknown error")
-                    );
+                        println!(
+                            "{:>12}  {:>10}  {:>10}  {:>10}  {:>6}  ({})",
+                            r.provider,
+                            "-",
+                            "-",
+                            "-",
+                            "-",
+                            r.error.as_deref().unwrap_or("unknown error")
+                        );
+                    }
                 }
+                println!();
             }
-        } else {
-            println!(
-                "No benchmark results cached. Run `ck --rebenchmark` or perform a semantic search to trigger benchmarking."
-            );
         }
         return Ok(());
     }
@@ -1025,11 +1104,20 @@ async fn run_main() -> Result<()> {
             "Running hardware acceleration benchmark for model: {}",
             config.name
         );
-        let providers = ck_embed::accel::select_provider(model, &config.name, true)?;
-        println!(
-            "\nBenchmark complete. {} provider(s) selected.",
-            providers.len()
-        );
+        let _ = ck_embed::accel::select_provider_with_profile(
+            model.clone(),
+            &config.name,
+            true,
+            ck_embed::accel::ProviderProfile::Search,
+        )?;
+        let providers = ck_embed::accel::select_provider_with_profile(
+            model,
+            &config.name,
+            true,
+            ck_embed::accel::ProviderProfile::Indexing,
+        )?;
+        println!("\nBenchmark complete.");
+        println!("Indexing-selected provider count: {}", providers.len());
         println!("Run `ck --show-benchmark` to see detailed results.");
         return Ok(());
     }

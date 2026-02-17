@@ -7,6 +7,21 @@ use crate::mixedbread::MixedbreadReranker;
 #[cfg(feature = "fastembed")]
 use std::path::PathBuf;
 
+#[cfg(feature = "fastembed")]
+use fastembed::RerankerModel;
+
+#[cfg(feature = "fastembed")]
+use ort::execution_providers::ExecutionProviderDispatch;
+
+#[cfg(feature = "fastembed")]
+use serde::{Deserialize, Serialize};
+
+#[cfg(feature = "fastembed")]
+use std::cmp::Ordering;
+
+#[cfg(feature = "fastembed")]
+use std::time::Instant;
+
 #[derive(Debug, Clone)]
 pub struct RerankResult {
     pub query: String,
@@ -85,6 +100,308 @@ impl DummyReranker {
     }
 }
 
+#[cfg(feature = "fastembed")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankProviderResult {
+    pub provider: String,
+    pub init_ms: f64,
+    pub avg_inf_ms: f64,
+    pub pairs_per_sec: f64,
+    pub workload_time_sec: f64,
+    pub error: Option<String>,
+}
+
+#[cfg(feature = "fastembed")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RerankBenchmarkCache {
+    #[serde(default)]
+    pub version: u32,
+    pub model: String,
+    pub timestamp: u64,
+    pub system_hash: String,
+    pub results: Vec<RerankProviderResult>,
+    pub selected: String,
+}
+
+#[cfg(feature = "fastembed")]
+const RERANK_BENCHMARK_CACHE_VERSION: u32 = 1;
+
+#[cfg(feature = "fastembed")]
+impl RerankBenchmarkCache {
+    fn cache_path(model_name: &str) -> PathBuf {
+        let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
+        let key = format!("rerank:{model_name}");
+        let hash = format!("{:x}", md5::compute(key.as_bytes()));
+        base.join("ck")
+            .join("benchmarks")
+            .join("rerank")
+            .join(hash)
+            .join("results.json")
+    }
+
+    pub fn load(model_name: &str) -> Option<Self> {
+        let path = Self::cache_path(model_name);
+        let data = std::fs::read_to_string(&path).ok()?;
+        let cache: Self = serde_json::from_str(&data).ok()?;
+
+        if cache.version != RERANK_BENCHMARK_CACHE_VERSION {
+            return None;
+        }
+
+        let current_hash = crate::accel::available_providers()
+            .ok()
+            .map(|v| format!("{:x}", md5::compute(v.join(",").as_bytes())))?;
+        if cache.system_hash != current_hash {
+            return None;
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        if now.saturating_sub(cache.timestamp) > 30 * 24 * 3600 {
+            return None;
+        }
+
+        Some(cache)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::cache_path(&self.model);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(self)?)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "fastembed")]
+fn rerank_model_from_name(model_name: &str) -> RerankerModel {
+    match model_name {
+        "jina-reranker-v1-turbo-en" => RerankerModel::JINARerankerV1TurboEn,
+        "bge-reranker-base" | "BAAI/bge-reranker-base" => RerankerModel::BGERerankerBase,
+        "jina-reranker-v2-base-multilingual" => RerankerModel::JINARerankerV2BaseMultiligual,
+        "bge-reranker-v2-m3" => RerankerModel::BGERerankerV2M3,
+        _ => RerankerModel::JINARerankerV1TurboEn,
+    }
+}
+
+#[cfg(feature = "fastembed")]
+fn rerank_bench_batch_size() -> usize {
+    std::env::var("CK_RERANK_BENCH_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(24)
+}
+
+#[cfg(feature = "fastembed")]
+fn rerank_bench_docs(batch_size: usize) -> Vec<String> {
+    (0..batch_size)
+        .map(|i| {
+            format!(
+                "Document {i}: fn parse_error(code: i32) -> Result<(), Error> {{ if code != 0 {{ return Err(Error::new(code)); }} Ok(()) }}"
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "fastembed")]
+fn normalize_rerank_provider_error(provider: &str, err: &str) -> String {
+    if err.contains("execution provider is not enabled in this build") {
+        return format!(
+            "{} execution provider is not available in the active ONNX Runtime library bundle",
+            provider.to_uppercase()
+        );
+    }
+
+    if err.contains("Failed to load shared library") {
+        return format!(
+            "{} provider shared library missing or not loadable (set CK_ORT_LIB_DIR to a valid ONNX Runtime lib directory)",
+            provider
+        );
+    }
+
+    err.to_string()
+}
+
+#[cfg(feature = "fastembed")]
+fn rerank_benchmark_one(
+    provider_name: &str,
+    provider: ExecutionProviderDispatch,
+    model: RerankerModel,
+    model_cache_dir: PathBuf,
+) -> RerankProviderResult {
+    use fastembed::{RerankInitOptions, TextRerank};
+
+    let start = Instant::now();
+    let init_options = RerankInitOptions::new(model)
+        .with_cache_dir(model_cache_dir)
+        .with_execution_providers(vec![provider]);
+
+    let mut reranker = match TextRerank::try_new(init_options) {
+        Ok(r) => r,
+        Err(e) => {
+            return RerankProviderResult {
+                provider: provider_name.to_string(),
+                init_ms: start.elapsed().as_secs_f64() * 1000.0,
+                avg_inf_ms: 0.0,
+                pairs_per_sec: 0.0,
+                workload_time_sec: 0.0,
+                error: Some(normalize_rerank_provider_error(provider_name, &e.to_string())),
+            };
+        }
+    };
+
+    let init_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let batch_size = rerank_bench_batch_size();
+    let docs = rerank_bench_docs(batch_size);
+    let doc_refs: Vec<&str> = docs.iter().map(|s| s.as_str()).collect();
+    let query = "error handling with context";
+
+    for _ in 0..2 {
+        let _ = reranker.rerank(query, doc_refs.clone(), true, None);
+    }
+
+    let mut total_measure = 0.0;
+    let mut iterations = 0usize;
+    let mut times = Vec::new();
+    while iterations < 2 || (iterations < 40 && total_measure < 0.5) {
+        let iter_start = Instant::now();
+        if let Err(e) = reranker.rerank(query, doc_refs.clone(), true, None) {
+            return RerankProviderResult {
+                provider: provider_name.to_string(),
+                init_ms,
+                avg_inf_ms: 0.0,
+                pairs_per_sec: 0.0,
+                workload_time_sec: 0.0,
+                error: Some(normalize_rerank_provider_error(provider_name, &e.to_string())),
+            };
+        }
+        let t = iter_start.elapsed().as_secs_f64();
+        total_measure += t;
+        times.push(t);
+        iterations += 1;
+    }
+
+    if iterations == 0 {
+        return RerankProviderResult {
+            provider: provider_name.to_string(),
+            init_ms,
+            avg_inf_ms: 0.0,
+            pairs_per_sec: 0.0,
+            workload_time_sec: 0.0,
+            error: Some("no measurement iterations completed".to_string()),
+        };
+    }
+
+    let avg_inf_ms = (times.iter().sum::<f64>() / times.len() as f64) * 1000.0;
+    let pairs_per_sec = ((batch_size * iterations) as f64) / total_measure.max(1e-9);
+    let workload_time_sec = init_ms / 1000.0 + total_measure;
+
+    RerankProviderResult {
+        provider: provider_name.to_string(),
+        init_ms,
+        avg_inf_ms,
+        pairs_per_sec,
+        workload_time_sec,
+        error: None,
+    }
+}
+
+#[cfg(feature = "fastembed")]
+fn select_rerank_provider(
+    model: RerankerModel,
+    model_name: &str,
+    model_cache_dir: &std::path::Path,
+    force_rebenchmark: bool,
+) -> Result<Vec<ExecutionProviderDispatch>> {
+    crate::accel::ensure_runtime_paths();
+
+    if let Ok(forced) = std::env::var("CK_FORCE_RERANK_PROVIDER")
+        .or_else(|_| std::env::var("CK_FORCE_PROVIDER"))
+    {
+        return Ok(vec![crate::accel::build_provider(&forced)?]);
+    }
+
+    if !force_rebenchmark
+        && let Some(cache) = RerankBenchmarkCache::load(model_name)
+        && crate::accel::available_providers()?.contains(&cache.selected)
+    {
+        return Ok(vec![crate::accel::build_provider(&cache.selected)?]);
+    }
+
+    let providers = crate::accel::available_providers()?;
+    let mut results = Vec::new();
+    for provider_name in &providers {
+        let provider = match crate::accel::build_provider(provider_name) {
+            Ok(p) => p,
+            Err(e) => {
+                results.push(RerankProviderResult {
+                    provider: provider_name.clone(),
+                    init_ms: 0.0,
+                    avg_inf_ms: 0.0,
+                    pairs_per_sec: 0.0,
+                    workload_time_sec: 0.0,
+                    error: Some(normalize_rerank_provider_error(provider_name, &e.to_string())),
+                });
+                continue;
+            }
+        };
+        results.push(rerank_benchmark_one(
+            provider_name,
+            provider,
+            model.clone(),
+            model_cache_dir.to_path_buf(),
+        ));
+    }
+
+    let winner = results
+        .iter()
+        .filter(|r| r.error.is_none())
+        .max_by(|a, b| {
+            a.pairs_per_sec
+                .partial_cmp(&b.pairs_per_sec)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    b.avg_inf_ms
+                        .partial_cmp(&a.avg_inf_ms)
+                        .unwrap_or(Ordering::Equal)
+                })
+        })
+        .map(|r| r.provider.clone())
+        .unwrap_or_else(|| "cpu".to_string());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let system_hash = format!(
+        "{:x}",
+        md5::compute(crate::accel::available_providers()?.join(",").as_bytes())
+    );
+    let cache = RerankBenchmarkCache {
+        version: RERANK_BENCHMARK_CACHE_VERSION,
+        model: model_name.to_string(),
+        timestamp: now,
+        system_hash,
+        results,
+        selected: winner.clone(),
+    };
+    let _ = cache.save();
+
+    Ok(vec![crate::accel::build_provider(&winner)?])
+}
+
+#[cfg(feature = "fastembed")]
+pub fn rebenchmark_reranker_provider(model_name: &str, force_rebenchmark: bool) -> Result<()> {
+    let model_cache_dir = FastReranker::get_model_cache_dir()?;
+    std::fs::create_dir_all(&model_cache_dir)?;
+    let model = rerank_model_from_name(model_name);
+    let _ = select_rerank_provider(model, model_name, &model_cache_dir, force_rebenchmark)?;
+    Ok(())
+}
+
 impl Default for DummyReranker {
     fn default() -> Self {
         Self::new()
@@ -129,15 +446,9 @@ impl FastReranker {
         model_name: &str,
         progress_callback: Option<RerankModelDownloadCallback>,
     ) -> Result<Self> {
-        use fastembed::{RerankInitOptions, RerankerModel, TextRerank};
+        use fastembed::{RerankInitOptions, TextRerank};
 
-        let model = match model_name {
-            "jina-reranker-v1-turbo-en" => RerankerModel::JINARerankerV1TurboEn,
-            "bge-reranker-base" => RerankerModel::BGERerankerBase,
-            "jina-reranker-v2-base-multilingual" => RerankerModel::JINARerankerV2BaseMultiligual,
-            "bge-reranker-v2-m3" => RerankerModel::BGERerankerV2M3,
-            _ => RerankerModel::JINARerankerV1TurboEn, // Default
-        };
+        let model = rerank_model_from_name(model_name);
 
         // Configure permanent model cache directory
         let model_cache_dir = Self::get_model_cache_dir()?;
@@ -159,9 +470,12 @@ impl FastReranker {
             }
         }
 
+        let providers = select_rerank_provider(model.clone(), model_name, &model_cache_dir, false)?;
+
         let init_options = RerankInitOptions::new(model.clone())
             .with_show_download_progress(progress_callback.is_some())
-            .with_cache_dir(model_cache_dir);
+            .with_cache_dir(model_cache_dir)
+            .with_execution_providers(providers);
 
         let reranker = TextRerank::try_new(init_options)?;
 

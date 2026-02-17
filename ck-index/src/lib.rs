@@ -15,6 +15,26 @@ use std::time::SystemTime;
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
+fn create_indexing_embedder(config: &ck_models::ModelConfig) -> Result<Box<dyn ck_embed::Embedder>> {
+    let previous_profile = std::env::var_os("CK_PROVIDER_PROFILE");
+    unsafe {
+        std::env::set_var("CK_PROVIDER_PROFILE", "indexing");
+    }
+
+    let result = ck_embed::create_embedder_for_config(config, None);
+
+    match previous_profile {
+        Some(v) => unsafe {
+            std::env::set_var("CK_PROVIDER_PROFILE", v);
+        },
+        None => unsafe {
+            std::env::remove_var("CK_PROVIDER_PROFILE");
+        },
+    }
+
+    result
+}
+
 fn legacy_model_config(name: &str, dimensions: Option<usize>) -> ck_models::ModelConfig {
     ck_models::ModelConfig {
         name: name.to_string(),
@@ -300,7 +320,7 @@ pub async fn index_directory(
         let (_, config) = resolved_model
             .as_ref()
             .expect("resolved model must be present when computing embeddings");
-        let mut embedder = ck_embed::create_embedder_for_config(config, None)?;
+        let mut embedder = create_indexing_embedder(config)?;
 
         for file_path in files.iter() {
             match index_single_file(file_path, path, Some(&mut embedder)) {
@@ -428,7 +448,7 @@ pub async fn index_file(file_path: &Path, compute_embeddings: bool) -> Result<()
         manifest.embedding_dimensions = Some(config.dimensions);
         tracing::debug!("Using embedding model '{}' ({})", config.name, alias);
 
-        let mut embedder = ck_embed::create_embedder_for_config(&config, None)?;
+        let mut embedder = create_indexing_embedder(&config)?;
         index_single_file(file_path, &repo_root, Some(&mut embedder))?
     } else {
         index_single_file(file_path, &repo_root, None)?
@@ -494,7 +514,7 @@ pub async fn update_index(
             alias
         );
 
-        let mut embedder = ck_embed::create_embedder_for_config(&config, None)?;
+        let mut embedder = create_indexing_embedder(&config)?;
         files
             .iter()
             .filter_map(|file_path| {
@@ -891,7 +911,7 @@ pub async fn smart_update_index_with_detailed_progress(
         let (_, config) = resolved_model
             .as_ref()
             .expect("resolved model must exist for embedding updates");
-        let mut embedder = ck_embed::create_embedder_for_config(config, None)?;
+        let mut embedder = create_indexing_embedder(config)?;
         let mut _processed_count = 0;
 
         for file_path in files_to_update.iter() {

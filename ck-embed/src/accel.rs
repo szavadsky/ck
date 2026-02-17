@@ -8,7 +8,9 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use ort::execution_providers::ExecutionProviderDispatch;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
@@ -24,7 +26,13 @@ pub fn available_providers() -> Result<Vec<String>> {
     {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
-            let candidates = ["cuda", "tensorrt", "openvino", "rocm"];
+            let candidates = [
+                "cuda",
+                "tensorrt",
+                "openvino-gpu",
+                "openvino-cpu",
+                "rocm",
+            ];
             for name in candidates {
                 if build_provider(name).is_ok() {
                     providers.push(name.to_string());
@@ -41,7 +49,13 @@ pub fn available_providers() -> Result<Vec<String>> {
 
         #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
         {
-            let candidates = ["cuda", "tensorrt", "openvino", "directml"];
+            let candidates = [
+                "cuda",
+                "tensorrt",
+                "openvino-gpu",
+                "openvino-cpu",
+                "directml",
+            ];
             for name in candidates {
                 if build_provider(name).is_ok() {
                     providers.push(name.to_string());
@@ -87,8 +101,10 @@ const BENCH_SAMPLES: &[&str] = &[
     "data Tree a = Leaf a | Branch (Tree a) (Tree a) deriving (Show, Eq)",
 ];
 
-const DEFAULT_BENCH_WORKLOAD_CHUNKS: usize = 240;
-const DEFAULT_BENCH_BATCH_SIZE: usize = 64;
+const DEFAULT_BENCH_WORKLOAD_CHUNKS_INDEXING: usize = 240;
+const DEFAULT_BENCH_BATCH_SIZE_INDEXING: usize = 64;
+const DEFAULT_BENCH_WORKLOAD_CHUNKS_SEARCH: usize = 32;
+const DEFAULT_BENCH_BATCH_SIZE_SEARCH: usize = 1;
 
 // ---------------------------------------------------------------------------
 // Serializable result types
@@ -108,6 +124,8 @@ pub struct ProviderResult {
 pub struct BenchmarkCache {
     #[serde(default)]
     pub version: u32,
+    #[serde(default)]
+    pub profile: String,
     pub model: String,
     pub timestamp: u64,
     pub system_hash: String,
@@ -115,20 +133,45 @@ pub struct BenchmarkCache {
     pub selected: String,
 }
 
-const BENCHMARK_CACHE_VERSION: u32 = 2;
+const BENCHMARK_CACHE_VERSION: u32 = 3;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProviderProfile {
+    Search,
+    Indexing,
+}
+
+impl ProviderProfile {
+    fn from_env() -> Self {
+        match std::env::var("CK_PROVIDER_PROFILE") {
+            Ok(v) if v.eq_ignore_ascii_case("index") || v.eq_ignore_ascii_case("indexing") => {
+                Self::Indexing
+            }
+            _ => Self::Search,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Indexing => "indexing",
+        }
+    }
+}
 
 impl BenchmarkCache {
-    fn cache_path(model_name: &str) -> PathBuf {
+    fn cache_path(model_name: &str, profile: ProviderProfile) -> PathBuf {
         let base = dirs::cache_dir().unwrap_or_else(|| PathBuf::from(".cache"));
-        let hash = format!("{:x}", md5::compute(model_name.as_bytes()));
+        let cache_key = format!("{model_name}:{}", profile.as_str());
+        let hash = format!("{:x}", md5::compute(cache_key.as_bytes()));
         base.join("ck")
             .join("benchmarks")
             .join(hash)
             .join("results.json")
     }
 
-    pub fn load(model_name: &str) -> Option<Self> {
-        let path = Self::cache_path(model_name);
+    pub fn load(model_name: &str, profile: ProviderProfile) -> Option<Self> {
+        let path = Self::cache_path(model_name, profile);
         let data = std::fs::read_to_string(&path).ok()?;
         let cache: Self = serde_json::from_str(&data).ok()?;
 
@@ -157,8 +200,8 @@ impl BenchmarkCache {
         Some(cache)
     }
 
-    pub fn save(&self) -> Result<()> {
-        let path = Self::cache_path(&self.model);
+    pub fn save(&self, profile: ProviderProfile) -> Result<()> {
+        let path = Self::cache_path(&self.model, profile);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -364,6 +407,10 @@ fn ensure_ort_runtime_paths() {
     }
 }
 
+pub fn ensure_runtime_paths() {
+    ensure_ort_runtime_paths();
+}
+
 fn normalize_provider_error(provider: &str, err: &str) -> String {
     if err.contains("execution provider is not enabled in this build") {
         return format!(
@@ -389,7 +436,7 @@ enum WinnerMetric {
     Workload,
 }
 
-fn winner_metric() -> WinnerMetric {
+fn winner_metric(profile: ProviderProfile) -> WinnerMetric {
     match std::env::var("CK_PROVIDER_SELECTION") {
         Ok(v) if v.eq_ignore_ascii_case("throughput") || v.eq_ignore_ascii_case("tps") => {
             WinnerMetric::Throughput
@@ -400,28 +447,37 @@ fn winner_metric() -> WinnerMetric {
         Ok(v) if v.eq_ignore_ascii_case("inference") || v.eq_ignore_ascii_case("latency") => {
             WinnerMetric::Inference
         }
-        _ => WinnerMetric::Throughput,
+        _ => match profile {
+            ProviderProfile::Search => WinnerMetric::Inference,
+            ProviderProfile::Indexing => WinnerMetric::Throughput,
+        },
     }
 }
 
-fn benchmark_batch_size() -> usize {
+fn benchmark_batch_size(profile: ProviderProfile) -> usize {
     std::env::var("CK_BENCH_BATCH_SIZE")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_BENCH_BATCH_SIZE)
+        .unwrap_or(match profile {
+            ProviderProfile::Search => DEFAULT_BENCH_BATCH_SIZE_SEARCH,
+            ProviderProfile::Indexing => DEFAULT_BENCH_BATCH_SIZE_INDEXING,
+        })
 }
 
-fn benchmark_workload_chunks() -> usize {
+fn benchmark_workload_chunks(profile: ProviderProfile) -> usize {
     std::env::var("CK_BENCH_WORKLOAD_CHUNKS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
-        .unwrap_or(DEFAULT_BENCH_WORKLOAD_CHUNKS)
+        .unwrap_or(match profile {
+            ProviderProfile::Search => DEFAULT_BENCH_WORKLOAD_CHUNKS_SEARCH,
+            ProviderProfile::Indexing => DEFAULT_BENCH_WORKLOAD_CHUNKS_INDEXING,
+        })
 }
 
-fn build_workload_samples() -> Vec<String> {
-    let target = benchmark_workload_chunks();
+fn build_workload_samples(profile: ProviderProfile) -> Vec<String> {
+    let target = benchmark_workload_chunks(profile);
     let mut samples = Vec::with_capacity(target);
     for i in 0..target {
         samples.push(BENCH_SAMPLES[i % BENCH_SAMPLES.len()].to_string());
@@ -482,10 +538,13 @@ pub fn build_provider(name: &str) -> Result<ExecutionProviderDispatch> {
                 all(target_os = "windows", target_arch = "x86_64"),
             )
         ))]
-        "openvino" => {
+        "openvino" | "openvino-gpu" | "openvino-cpu" => {
             use ort::execution_providers::OpenVINOExecutionProvider;
-            let device = std::env::var("CK_OPENVINO_DEVICE")
-                .unwrap_or_else(|_| "GPU".to_string());
+            let device = match name {
+                "openvino-cpu" => "CPU".to_string(),
+                "openvino-gpu" => "GPU".to_string(),
+                _ => std::env::var("CK_OPENVINO_DEVICE").unwrap_or_else(|_| "GPU".to_string()),
+            };
             let opencl_throttling = std::env::var("CK_OPENVINO_OPENCL_THROTTLING")
                 .ok()
                 .and_then(|v| match v.to_ascii_lowercase().as_str() {
@@ -546,6 +605,7 @@ pub fn benchmark_one(
     provider: ExecutionProviderDispatch,
     name: &str,
     model: EmbeddingModel,
+    profile: ProviderProfile,
 ) -> ProviderResult {
     let start = Instant::now();
 
@@ -582,8 +642,8 @@ pub fn benchmark_one(
     };
     let init_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    let samples = build_workload_samples();
-    let batch_size = benchmark_batch_size();
+    let samples = build_workload_samples(profile);
+    let batch_size = benchmark_batch_size(profile);
 
     // 2 warmup iterations
     for _ in 0..2 {
@@ -639,6 +699,22 @@ pub fn benchmark_one(
     }
 }
 
+fn indexing_provider_map() -> &'static Mutex<HashMap<String, String>> {
+    static INDEXING_PROVIDER_MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    INDEXING_PROVIDER_MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_indexing_provider(model_name: &str, provider: &str) {
+    if let Ok(mut guard) = indexing_provider_map().lock() {
+        guard.insert(model_name.to_string(), provider.to_string());
+    }
+}
+
+fn indexing_provider_for_model(model_name: &str) -> Option<String> {
+    let guard = indexing_provider_map().lock().ok()?;
+    guard.get(model_name).cloned()
+}
+
 // ---------------------------------------------------------------------------
 // Main public API
 // ---------------------------------------------------------------------------
@@ -652,18 +728,47 @@ pub fn select_provider(
     model_name: &str,
     force_rebenchmark: bool,
 ) -> Result<Vec<ExecutionProviderDispatch>> {
+    select_provider_with_profile(
+        model,
+        model_name,
+        force_rebenchmark,
+        ProviderProfile::from_env(),
+    )
+}
+
+pub fn select_provider_with_profile(
+    model: EmbeddingModel,
+    model_name: &str,
+    force_rebenchmark: bool,
+    profile: ProviderProfile,
+) -> Result<Vec<ExecutionProviderDispatch>> {
     ensure_ort_runtime_paths();
 
     // 1. Check env-var override
     if let Ok(forced) = std::env::var("CK_FORCE_PROVIDER") {
         eprintln!("[accel] CK_FORCE_PROVIDER={forced} – using forced provider");
         let p = build_provider(&forced)?;
+        if profile == ProviderProfile::Indexing {
+            remember_indexing_provider(model_name, &forced);
+        }
         return Ok(vec![p]);
+    }
+
+    if profile == ProviderProfile::Search
+        && !force_rebenchmark
+        && let Some(indexing_provider) = indexing_provider_for_model(model_name)
+        && available_providers()?.contains(&indexing_provider)
+    {
+        eprintln!(
+            "[accel] reusing indexing-loaded provider for search: {}",
+            indexing_provider
+        );
+        return Ok(vec![build_provider(&indexing_provider)?]);
     }
 
     // 2. Check cache
     if !force_rebenchmark {
-        if let Some(cache) = BenchmarkCache::load(model_name) {
+        if let Some(cache) = BenchmarkCache::load(model_name, profile) {
             let current_available = available_providers()?;
             let cached_providers: std::collections::HashSet<_> = cache.results.iter().map(|r| r.provider.as_str()).collect();
             let current_set: std::collections::HashSet<_> = current_available.iter().map(|s| s.as_str()).collect();
@@ -679,6 +784,9 @@ pub fn select_provider(
                         .unwrap_or(0.0)
                 );
                 let p = build_provider(&cache.selected)?;
+                if profile == ProviderProfile::Indexing {
+                    remember_indexing_provider(model_name, &cache.selected);
+                }
                 return Ok(vec![p]);
             } else {
                 eprintln!("[accel] cached results outdated (providers changed), re-benchmarking");
@@ -724,7 +832,7 @@ pub fn select_provider(
                 continue;
             }
         };
-        let mut result = benchmark_one(provider, name, model.clone());
+        let mut result = benchmark_one(provider, name, model.clone(), profile);
         if let Some(err) = result.error.take() {
             result.error = Some(normalize_provider_error(name, &err));
         }
@@ -740,7 +848,7 @@ pub fn select_provider(
     }
 
     // 4. Pick winner
-    let metric = winner_metric();
+    let metric = winner_metric(profile);
     let winner = results
         .iter()
         .filter(|r| r.error.is_none())
@@ -791,14 +899,19 @@ pub fn select_provider(
 
     let cache = BenchmarkCache {
         version: BENCHMARK_CACHE_VERSION,
+        profile: profile.as_str().to_string(),
         model: model_name.to_string(),
         timestamp: now,
         system_hash: system_hash(),
         results,
         selected: winner.clone(),
     };
-    if let Err(e) = cache.save() {
+    if let Err(e) = cache.save(profile) {
         eprintln!("[accel] warning: failed to save cache: {e}");
+    }
+
+    if profile == ProviderProfile::Indexing {
+        remember_indexing_provider(model_name, &winner);
     }
 
     // 6. Return
