@@ -87,6 +87,9 @@ const BENCH_SAMPLES: &[&str] = &[
     "data Tree a = Leaf a | Branch (Tree a) (Tree a) deriving (Show, Eq)",
 ];
 
+const DEFAULT_BENCH_WORKLOAD_CHUNKS: usize = 240;
+const DEFAULT_BENCH_BATCH_SIZE: usize = 64;
+
 // ---------------------------------------------------------------------------
 // Serializable result types
 // ---------------------------------------------------------------------------
@@ -381,17 +384,63 @@ fn normalize_provider_error(provider: &str, err: &str) -> String {
 
 #[derive(Copy, Clone)]
 enum WinnerMetric {
+    Throughput,
     Inference,
     Workload,
 }
 
 fn winner_metric() -> WinnerMetric {
     match std::env::var("CK_PROVIDER_SELECTION") {
+        Ok(v) if v.eq_ignore_ascii_case("throughput") || v.eq_ignore_ascii_case("tps") => {
+            WinnerMetric::Throughput
+        }
         Ok(v) if v.eq_ignore_ascii_case("workload") || v.eq_ignore_ascii_case("total") => {
             WinnerMetric::Workload
         }
-        _ => WinnerMetric::Inference,
+        Ok(v) if v.eq_ignore_ascii_case("inference") || v.eq_ignore_ascii_case("latency") => {
+            WinnerMetric::Inference
+        }
+        _ => WinnerMetric::Throughput,
     }
+}
+
+fn benchmark_batch_size() -> usize {
+    std::env::var("CK_BENCH_BATCH_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_BENCH_BATCH_SIZE)
+}
+
+fn benchmark_workload_chunks() -> usize {
+    std::env::var("CK_BENCH_WORKLOAD_CHUNKS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_BENCH_WORKLOAD_CHUNKS)
+}
+
+fn build_workload_samples() -> Vec<String> {
+    let target = benchmark_workload_chunks();
+    let mut samples = Vec::with_capacity(target);
+    for i in 0..target {
+        samples.push(BENCH_SAMPLES[i % BENCH_SAMPLES.len()].to_string());
+    }
+    samples
+}
+
+fn run_embed_workload(
+    embedding: &mut TextEmbedding,
+    samples: &[String],
+    batch_size: usize,
+) -> Result<(), String> {
+    for batch in samples.chunks(batch_size) {
+        let batch_vec = batch.to_vec();
+        embedding
+            .embed(batch_vec, None)
+            .map_err(|e| format!("inference error: {e}"))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -533,11 +582,12 @@ pub fn benchmark_one(
     };
     let init_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-    let samples: Vec<String> = BENCH_SAMPLES.iter().map(|s| s.to_string()).collect();
+    let samples = build_workload_samples();
+    let batch_size = benchmark_batch_size();
 
     // 2 warmup iterations
     for _ in 0..2 {
-        let _ = embedding.embed(samples.clone(), None);
+        let _ = run_embed_workload(&mut embedding, &samples, batch_size);
     }
 
     // Measurement iterations: run at least 2 iterations, up to 0.5 seconds total
@@ -547,14 +597,14 @@ pub fn benchmark_one(
     let mut iterations = 0;
     while iterations < 2 || (iterations < 50 && total_measure < max_measure_time) {
         let iter_start = Instant::now();
-        if let Err(e) = embedding.embed(samples.clone(), None) {
+        if let Err(e) = run_embed_workload(&mut embedding, &samples, batch_size) {
             return ProviderResult {
                 provider: name.to_string(),
                 init_ms,
                 avg_inf_ms: 0.0,
                 tokens_per_sec: 0.0,
                 workload_time_sec: 0.0,
-                error: Some(format!("inference error: {e}")),
+                error: Some(e),
             };
         }
         let iter_time = iter_start.elapsed().as_secs_f64();
@@ -575,7 +625,7 @@ pub fn benchmark_one(
     }
 
     let avg_inf_ms = (measure_times.iter().sum::<f64>() / measure_times.len() as f64) * 1000.0;
-    let total_tokens_approx = (BENCH_SAMPLES.len() as f64) * 30.0 * (iterations as f64);
+    let total_tokens_approx = (samples.len() as f64) * 30.0 * (iterations as f64);
     let tokens_per_sec = total_tokens_approx / total_measure;
     let workload_time_sec = init_ms / 1000.0 + total_measure;
 
@@ -695,6 +745,15 @@ pub fn select_provider(
         .iter()
         .filter(|r| r.error.is_none())
         .min_by(|a, b| match metric {
+            WinnerMetric::Throughput => b
+                .tokens_per_sec
+                .partial_cmp(&a.tokens_per_sec)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    a.avg_inf_ms
+                        .partial_cmp(&b.avg_inf_ms)
+                        .unwrap_or(Ordering::Equal)
+                }),
             WinnerMetric::Inference => a
                 .avg_inf_ms
                 .partial_cmp(&b.avg_inf_ms)
@@ -718,6 +777,7 @@ pub fn select_provider(
         .unwrap_or_else(|| "cpu".to_string());
 
     let metric_name = match metric {
+        WinnerMetric::Throughput => "throughput",
         WinnerMetric::Inference => "inference",
         WinnerMetric::Workload => "workload",
     };

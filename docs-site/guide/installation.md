@@ -396,6 +396,9 @@ CK_FORCE_PROVIDER=openvino CK_OPENVINO_DEVICE=GPU ck --sem "query" src/
 
 # Optional selection strategy override
 CK_PROVIDER_SELECTION=workload ck --rebenchmark
+
+# Practical benchmark tuning (optional)
+CK_BENCH_BATCH_SIZE=64 CK_BENCH_WORKLOAD_CHUNKS=240 ck --rebenchmark
 ```
 
 ::: tip
