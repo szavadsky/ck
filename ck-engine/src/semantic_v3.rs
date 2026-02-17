@@ -1,5 +1,6 @@
 use anyhow::Result;
 use ck_core::{CkError, SearchOptions, SearchResult};
+use rayon::prelude::*;
 use std::path::Path;
 use walkdir::WalkDir;
 
@@ -38,31 +39,44 @@ pub async fn semantic_search_v3_with_progress(
         callback("Loading embeddings from sidecar files...");
     }
 
-    // Collect all sidecar files and their embeddings
-    let mut file_chunks: Vec<(std::path::PathBuf, ck_index::ChunkEntry)> = Vec::new();
-
+    // Collect sidecar paths first, then load them in parallel.
+    let mut sidecar_paths = Vec::new();
     for entry in WalkDir::new(&index_dir) {
         let entry = entry?;
-        if entry.file_type().is_file() {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("ck") {
-                // Load the sidecar file
-                if let Ok(index_entry) = ck_index::load_index_entry(path) {
-                    let original_file = reconstruct_original_path(path, &index_dir, &index_root);
-                    if let Some(original_file) = original_file {
-                        if !super::path_matches_include(&original_file, &options.include_patterns) {
-                            continue;
-                        }
-                        for chunk in index_entry.chunks {
-                            if chunk.embedding.is_some() {
-                                file_chunks.push((original_file.clone(), chunk));
-                            }
-                        }
-                    }
-                }
-            }
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("ck")
+        {
+            sidecar_paths.push(entry.path().to_path_buf());
         }
     }
+
+    // Collect all sidecar embeddings in parallel.
+    let file_chunks: Vec<(std::path::PathBuf, ck_index::ChunkEntry)> = sidecar_paths
+        .into_par_iter()
+        .flat_map_iter(|sidecar_path| {
+            let Ok(index_entry) = ck_index::load_index_entry(&sidecar_path) else {
+                return Vec::new().into_iter();
+            };
+
+            let Some(original_file) =
+                reconstruct_original_path(&sidecar_path, &index_dir, &index_root)
+            else {
+                return Vec::new().into_iter();
+            };
+
+            if !super::path_matches_include(&original_file, &options.include_patterns) {
+                return Vec::new().into_iter();
+            }
+
+            index_entry
+                .chunks
+                .into_iter()
+                .filter(|chunk| chunk.embedding.is_some())
+                .map(move |chunk| (original_file.clone(), chunk))
+                .collect::<Vec<_>>()
+                .into_iter()
+        })
+        .collect();
 
     if file_chunks.is_empty() {
         return Err(CkError::Index(
