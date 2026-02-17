@@ -466,7 +466,11 @@ CK_FORCE_PROVIDER=openvino CK_OPENVINO_DEVICE=GPU ck --sem "query" src/
 # CK_OPENVINO_OPENCL_THROTTLING=true|false  (default: true)
 
 # Provider selection strategy
-# CK_PROVIDER_SELECTION=inference|workload  (default: inference)
+# CK_PROVIDER_SELECTION=throughput|inference|workload  (default: throughput)
+
+# Benchmark workload tuning (optional)
+# CK_BENCH_BATCH_SIZE=64
+# CK_BENCH_WORKLOAD_CHUNKS=240
 
 # Explicit ORT runtime directory override (contains libonnxruntime*.so + providers)
 # CK_ORT_LIB_DIR=/path/to/onnxruntime/lib
@@ -479,7 +483,7 @@ cargo install ck-search --features cpu-only
 
 1. On first semantic search, ck tests all compiled execution providers
 2. Each provider runs 5 warmup + 20 measurement iterations
-3. The fastest provider (lowest average inference latency by default) is selected
+3. The fastest provider (highest practical batched throughput by default) is selected
 4. Results are cached in `~/.cache/ck/benchmarks/` for 30 days
 5. Cache auto-invalidates when GPU hardware or drivers change
 
